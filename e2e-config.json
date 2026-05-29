@@ -1,0 +1,192 @@
+{
+  "global": {
+    "worktreeBasePath": "./.e2e-worktrees",
+    "cleanOnTeardown": false,
+    "network": null
+  },
+  "services": {
+    "queue-service": {
+      "repoPath": "../queue-service",
+      "target": "main",
+      "composeServiceEnvOverrides": {
+        "kafka-region": {
+          "KAFKA_CFG_ADVERTISED_LISTENERS": "INTERNAL://kafka-region:9092,EXTERNAL://kafka-region:9093,CONTROLLER://kafka-region:9094"
+        },
+        "kafka-global": {
+          "KAFKA_CFG_ADVERTISED_LISTENERS": "INTERNAL://kafka-global:9092,EXTERNAL://kafka-global:9193,CONTROLLER://kafka-global:9094"
+        }
+      },
+      "instances": []
+    },
+    "slot-game-server": {
+      "repoPath": "../slot-game-server",
+      "target": "main",
+      "instances": [
+        {
+          "name": "sgs-core",
+          "count": 1,
+          "envBase": ".env.example",
+          "envOverrides": {
+            "PORT": "9000",
+            "APP_ENV": "DEV",
+            "SLOT_GAME_API_SIGNATURE": "rgs-local-signature",
+            "APP_CLOUD_REGION": "us-east-2"
+          },
+          "networkEnvOverrides": {},
+          "commands": [
+            { "run": "npm install", "sync": true },
+            { "run": "npm run build", "sync": true },
+            { "run": "node --enable-source-maps build/index.js", "sync": false }
+          ],
+          "healthCheck": "http://127.0.0.1:9000/v1/service/healthcheck"
+        }
+      ]
+    },
+    "remote-game-server": {
+      "repoPath": "../remote-game-server",
+      "target": "main",
+      "composeServiceEnvOverrides": {
+        "redis": {
+          "_note": "Redis cluster gossip uses 127.0.0.1 internally. Bridge mode requires --cluster-announce-hostname redis-cluster in the Redis startup command. Override the command here if needed."
+        }
+      },
+      "instances": [
+        {
+          "name": "billing",
+          "count": 1,
+          "envBase": ".env.billing.example",
+          "envOverrides": {
+            "NODE_PATH": "./build",
+            "SLOT_GAME_SERVICE_URL": "http://127.0.0.1:9000",
+            "MONEY_SERVICE_URL": "https://money-service.iki-cit.cc",
+            "PLAYER_SERVICE_URL": "https://player-service.iki-cit.cc",
+            "API_HUB_SERVICE_URL": "https://api-hub.iki-cit.cc",
+            "S3_ENDPOINT": "http://127.0.0.1:7002"
+          },
+          "networkEnvOverrides": {
+            "QUEUE_HOST_NAMES": "kafka-region:9093",
+            "GLOBAL_QUEUE_HOST_NAMES": "kafka-global:9193",
+            "REDIS_HOST": "redis-cluster",
+            "JOB_LOCKER_HOST": "redis-cluster",
+            "MONGO_HOST": "mongo-primary",
+            "MONGO_PORT": "27017",
+            "DB_HOST": "db",
+            "DB_PORT": "5432",
+            "DB_SLAVE_HOST": "db",
+            "DB_SLAVE_PORT": "5432",
+            "S3_ENDPOINT": "http://rustfs:9000"
+          },
+          "commands": [
+            { "run": "npm install", "sync": true },
+            { "run": "npm run build", "sync": true },
+            { "run": "node --enable-source-maps build/index.js", "sync": false }
+          ],
+          "healthCheck": "http://127.0.0.1:8080/v2/service/healthcheck"
+        },
+        {
+          "name": "game-activity",
+          "count": 1,
+          "envBase": ".env.game-activity.example",
+          "envOverrides": { "NODE_PATH": "./build" },
+          "networkEnvOverrides": {
+            "QUEUE_HOST_NAMES": "kafka-region:9093",
+            "REDIS_HOST": "redis-cluster",
+            "JOB_LOCKER_HOST": "redis-cluster"
+          },
+          "commands": [
+            { "run": "node --enable-source-maps build/index.js", "sync": false }
+          ],
+          "healthCheck": "http://127.0.0.1:8070/v2/service/healthcheck"
+        },
+        {
+          "name": "bridge",
+          "count": 1,
+          "envBase": ".env.bridge.example",
+          "envOverrides": {
+            "NODE_PATH": "./build",
+            "RGS_PORT": "7001",
+            "CORE_SLOT_RGS_SERVICE_URL": "http://127.0.0.1:8080"
+          },
+          "networkEnvOverrides": {
+            "QUEUE_HOST_NAMES": "kafka-region:9093",
+            "GLOBAL_QUEUE_HOST_NAMES": "kafka-global:9193",
+            "REDIS_HOST": "redis-cluster",
+            "CORE_SLOT_RGS_SERVICE_URL": "http://billing:8080"
+          },
+          "commands": [
+            { "run": "while ! curl -s http://127.0.0.1:8080/v2/service/healthcheck > /dev/null; do sleep 1; done && node --enable-source-maps build/index.js", "sync": false }
+          ]
+        },
+        {
+          "name": "job-stale-rounds",
+          "count": 1,
+          "envBase": ".env.job.example",
+          "envOverrides": {
+            "NODE_PATH": "./build",
+            "RGS_PORT": "8090",
+            "CORE_SLOT_RGS_SERVICE_URL": "http://127.0.0.1:8080",
+            "SLOT_GAME_SERVICE_URL": "http://127.0.0.1:9000"
+          },
+          "networkEnvOverrides": {
+            "QUEUE_HOST_NAMES": "kafka-region:9093",
+            "REDIS_HOST": "redis-cluster",
+            "CORE_SLOT_RGS_SERVICE_URL": "http://billing:8080",
+            "SLOT_GAME_SERVICE_URL": "http://sgs-core:9000"
+          },
+          "commands": [
+            { "run": "while ! curl -s http://127.0.0.1:8080/v2/service/healthcheck > /dev/null; do sleep 1; done && node --enable-source-maps build/index.js -r play-stale-rounds", "sync": false }
+          ]
+        },
+        {
+          "name": "job-close-inactive",
+          "count": 1,
+          "envBase": ".env.job.example",
+          "envOverrides": {
+            "NODE_PATH": "./build",
+            "RGS_PORT": "8091",
+            "CORE_SLOT_RGS_SERVICE_URL": "http://127.0.0.1:8080",
+            "SLOT_GAME_SERVICE_URL": "http://127.0.0.1:9000"
+          },
+          "networkEnvOverrides": {
+            "QUEUE_HOST_NAMES": "kafka-region:9093",
+            "REDIS_HOST": "redis-cluster",
+            "CORE_SLOT_RGS_SERVICE_URL": "http://billing:8080",
+            "SLOT_GAME_SERVICE_URL": "http://sgs-core:9000"
+          },
+          "commands": [
+            { "run": "while ! curl -s http://127.0.0.1:8080/v2/service/healthcheck > /dev/null; do sleep 1; done && node --enable-source-maps build/index.js -r session-close-inactive-and-stale", "sync": false }
+          ]
+        },
+        {
+          "name": "game",
+          "count": 1,
+          "envBase": ".env.game.example",
+          "envOverrides": {
+            "NODE_PATH": "./build",
+            "CORE_SLOT_RGS_SERVICE_URL": "http://127.0.0.1:8080",
+            "SLOT_GAME_SERVICE_URL": "http://127.0.0.1:9000",
+            "SLOT_GAME_ACTIVITY_SERVICE_URL": "http://127.0.0.1:8070",
+            "MONEY_SERVICE_URL": "https://money-service.iki-cit.cc",
+            "PLAYER_SERVICE_URL": "https://player-service.iki-cit.cc",
+            "API_HUB_SERVICE_URL": "https://api-hub-gs1.iki-cit.cc"
+          },
+          "networkEnvOverrides": {
+            "QUEUE_HOST_NAMES": "kafka-region:9093",
+            "GLOBAL_QUEUE_HOST_NAMES": "kafka-global:9193",
+            "REDIS_HOST": "redis-cluster",
+            "JOB_LOCKER_HOST": "redis-cluster",
+            "MONGO_HOST": "mongo-primary",
+            "MONGO_PORT": "27017",
+            "CORE_SLOT_RGS_SERVICE_URL": "http://billing:8080",
+            "SLOT_GAME_SERVICE_URL": "http://sgs-core:9000",
+            "SLOT_GAME_ACTIVITY_SERVICE_URL": "http://game-activity:8070"
+          },
+          "commands": [
+            { "run": "while ! curl -s http://127.0.0.1:8080/v2/service/healthcheck > /dev/null; do sleep 1; done && node --enable-source-maps build/index.js", "sync": false }
+          ],
+          "healthCheck": "http://127.0.0.1:19080/v2/service/healthcheck"
+        }
+      ]
+    }
+  }
+}

@@ -1,0 +1,24 @@
+FROM oven/bun:latest
+
+# Install Node.js, Git, Docker CLI, and Docker Compose
+RUN apt-get update && apt-get install -y \
+    curl \
+    git \
+    nodejs \
+    npm \
+    lsof \
+    && curl -fsSL https://get.docker.com -o get-docker.sh \
+    && sh get-docker.sh \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Install dependencies
+COPY package.json bun.lockb* ./
+RUN bun install
+
+# Copy source code
+COPY . .
+
+# Run the test suite natively through the wrapper script
+CMD ["bun", "run", "test"]

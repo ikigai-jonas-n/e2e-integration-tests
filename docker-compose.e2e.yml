@@ -1,0 +1,39 @@
+version: '3.8'
+
+# ── Mode A: Host networking (default, local dev) ─────────────────────────────
+# Kafka advertises localhost:9093 — works because host network shares loopback.
+# Switch to Mode B for CI bridge isolation.
+
+services:
+  e2e-orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.e2e
+    container_name: e2e-orchestrator
+    volumes:
+      - .:/app
+      - /var/run/docker.sock:/var/run/docker.sock
+    network_mode: "host"
+    environment:
+      - CI=true
+      # Set E2E_FAST=1 to skip git pull / docker / migrations on warm reruns
+      # - E2E_FAST=1
+
+# ── Mode B: Bridge network ────────────────────────────────────────────────────
+# To enable:
+#   1. Comment out `network_mode: "host"` above
+#   2. Uncomment the networks block below + the networks: section on the service
+#   3. Set `"network": "e2e-net"` in e2e-config.json → global
+#   4. ⚠️  Redis cluster fix required: the cluster creation script in
+#          .e2e-worktrees/remote-game-server/docker-compose.yml must add
+#          --cluster-announce-hostname redis-cluster
+#          to each `valkey-server` invocation so cluster gossip uses the
+#          container name instead of 127.0.0.1.
+#
+#   networks:
+#     - e2e-net
+#
+# networks:
+#   e2e-net:
+#     name: e2e-net
+#     driver: bridge
