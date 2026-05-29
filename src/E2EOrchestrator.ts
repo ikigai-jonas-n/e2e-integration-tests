@@ -290,6 +290,9 @@ export class E2EOrchestrator {
   }
 
   async startInfrastructure() {
+    // 👇 Make sure Docker is alive before doing anything with Compose
+    this.ensureDockerRunning();
+
     if (this._warmStart) {
       console.log('⚡ Warm start: skipping Docker infrastructure startup.');
       return;
@@ -480,11 +483,12 @@ export class E2EOrchestrator {
 
     // ASSASSINATE ORPHANED NODE PROCESSES (Excluding ourselves)
     const ports = this.portsToClear;
-    const myPid = process.pid; // Prevent suicide
-    console.log(`   🧹 Clearing orphaned processes on ports: [${ports.join(', ')}]`);
+    const myPid = process.pid;
+    console.log(`   🧹 Clearing node/bun processes on ports: [${ports.join(', ')}]`);
     for (const port of ports) {
       try {
-        execSync(`lsof -t -i:${port} | grep -v '^${myPid}$' | xargs kill -9 2>/dev/null || true`);
+        // STRICTLY kill only 'node' or 'bun' commands, excluding our own orchestrator PID
+        execSync(`lsof -i:${port} | grep -E 'node|bun' | awk '{print $2}' | grep -v '^${myPid}$' | sort -u | xargs kill -9 2>/dev/null || true`);
       } catch (e) {}
     }
 
@@ -506,6 +510,35 @@ export class E2EOrchestrator {
       }
       if (config.global.cleanOnTeardown) {
         fs.rmSync(this.worktreeBase, { recursive: true, force: true });
+      }
+    }
+  }
+
+  private ensureDockerRunning() {
+    try {
+      // Check if daemon responds
+      execSync('docker info', { stdio: 'ignore' });
+    } catch {
+      console.log('🐳 Docker daemon is down. Attempting to auto-start Docker Desktop...');
+      if (process.platform === 'darwin') {
+        // macOS command to launch the Docker Desktop app
+        execSync('open -a Docker');
+        console.log('⏳ Waiting for Docker VM to boot (this may take up to 30 seconds)...');
+        
+        let ready = false;
+        for (let i = 0; i < 40; i++) {
+          try {
+            execSync('docker info', { stdio: 'ignore' });
+            ready = true;
+            console.log('✅ Docker daemon is now online!');
+            break;
+          } catch {}
+          execSync('sleep 1'); // wait 1s before polling again
+        }
+        
+        if (!ready) throw new Error('Timeout: Docker daemon failed to start.');
+      } else {
+        throw new Error('Docker daemon is not running. Auto-start is only supported on macOS.');
       }
     }
   }
