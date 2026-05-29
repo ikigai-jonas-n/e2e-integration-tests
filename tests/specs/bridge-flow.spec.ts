@@ -2,10 +2,10 @@ import { it, expect } from 'bun:test';
 import { api } from '../utils/api';
 import { BILLING, GAME, SVC_SIG } from '../utils/config';
 
-export function runInternalTests() {
+export function runBridgeFlowTests() {
   let amToken = '';
 
-  it('Generates AM Token', async () => {
+  it('Step 1: Billing generates AM Token', async () => {
     const res = await api.post(`${BILLING}/v1/service/am/token`, {
       userId: 0, account: 'tester', code: 'SLT',
       permission: [{ routeKey: '*', methods: ['*'] }],
@@ -16,21 +16,21 @@ export function runInternalTests() {
     expect(amToken).toBeTruthy();
   });
 
-  it('Disables LGS-001 globally and propagates via Kafka', async () => {
+  it('Step 2: Billing disables LGS-001 and fires Kafka propagation', async () => {
     const res = await api.patch(`${BILLING}/v1/internal/games/status`, {
       data: [{ code: 'LGS-001', enabled: false }],
     }, { headers: { 'x-access-token': amToken } });
     expect(res.status).toBe(200);
 
-    // Fire consolidated Kafka event so Bridge updates Redis before the poll starts.
-    // Game node cron runs every 60s — Redis must be fresh for it to pick up the change.
+    // Evict Redis game codes key → game node forced to use billing-site fallback
+    // on next cron, guaranteeing it reads the disabled state
     await api.propagateConfig(amToken);
   });
 
-  it('Game node reflects disabled state within 75s (cron-based)', async () => {
+  it('Step 3: Game node reflects disabled state within 65s', async () => {
     let isGameDisabled = false;
-    // 65s = 60s max cron interval + 5s processing buffer.
-    // Redis eviction in propagateConfig/resetGameState guarantees billing-fallback data on first cron hit.
+    // 65s = 60s max cron interval + 5s buffer
+    // Redis eviction in propagateConfig ensures billing-fallback on first cron hit
     for (let i = 0; i < 65; i++) {
       const res = await api.get(`${GAME}/v2/service/games`, { headers: SVC_SIG });
       const games = res.data?.data?.games ?? res.data?.data;
@@ -41,13 +41,11 @@ export function runInternalTests() {
     expect(isGameDisabled).toBe(true);
   }, 90000);
 
-  it('Restores LGS-001 to enabled with EUR bet level 2', async () => {
-    // resetGameState: enables game + sets betLevels + propagateConfig in one call
+  it('Step 4: Restores LGS-001 (enabled + EUR bet level 2)', async () => {
+    // resetGameState: PATCH enable + PATCH betLevels + propagateConfig
     await api.resetGameState('LGS-001', amToken);
 
     let isRestored = false;
-    // 65s = 60s max cron interval + 5s processing buffer.
-    // Redis eviction in propagateConfig/resetGameState guarantees billing-fallback data on first cron hit.
     for (let i = 0; i < 65; i++) {
       const res = await api.get(`${GAME}/v2/service/games`, { headers: SVC_SIG });
       const games = res.data?.data?.games ?? res.data?.data;

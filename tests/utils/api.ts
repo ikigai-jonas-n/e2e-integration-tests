@@ -1,4 +1,4 @@
-import { BILLING, GAME, SVC_SIG } from './config';
+import { BILLING, SVC_SIG } from './config';
 
 export const api = {
   post: async (url: string, body: any, options?: any) => {
@@ -25,27 +25,41 @@ export const api = {
   },
 
   /**
-   * LIGHTNING SPEED SYNC: 
-   * Discovery-based propagation. Fetches current state from Billing 
-   * and forces the Game node to refresh its memory cache instantly.
+   * Fires a consolidated Kafka event so Bridge updates Redis with the latest game states.
+   * The Game node (PERIPHERAL) reads Redis on its 60s cron — call this before polling
+   * to guarantee Redis is fresh, maximising the chance of an early-exit in the poll loop.
+   *
+   * Note: the Game node has no force-refresh HTTP endpoint (it's PERIPHERAL with no DB
+   * access). The 60s cron cycle is unavoidable — this helper just ensures Redis is ready.
    */
   propagateConfig: async (amToken: string) => {
-    // 1. Discover current game states from Billing
+    // 1. Read current game states from Billing's process cache
     const res = await api.get(`${BILLING}/v2/service/games`, { headers: SVC_SIG });
     const games = res.data?.data?.games ?? res.data?.data;
-    
+
+    // 2. Re-PATCH all games → publishes GAME_DATA Kafka event
+    //    → Bridge receives → updates Redis with fresh state
     if (Array.isArray(games)) {
-      // 2. Re-patch current status to ensure Bridge/Redis is fresh via Kafka
-      const statusPayload = {
+      await api.patch(`${BILLING}/v1/internal/games/status`, {
         data: games.map((g: any) => ({ code: g.code, enabled: g.enabled }))
-      };
-      await api.patch(`${BILLING}/v1/internal/games/status`, statusPayload, {
-        headers: { 'x-access-token': amToken }
-      });
+      }, { headers: { 'x-access-token': amToken } });
     }
 
-    // 3. Force the Game Node to pull from Redis immediately (bypassing 60s cron)
-    await api.get(`${GAME}/v2/service/sync-games`, { headers: SVC_SIG });
+    // 3. Wait for Bridge to process the Kafka event and write updated game states to Redis
+    await new Promise(r => setTimeout(r, 2500));
+
+    // 4. Evict the game codes registry key from Redis.
+    //    Key: {no_version}:gameCodes  (VERSION env var is unset → defaults to 'no_version')
+    //    Effect: next time the game node's 60s cron fires, syncGamesFromRedisToProcessCache()
+    //    returns false (empty registry) → immediately falls back to syncGamesFromBillingSiteToProcessCache()
+    //    which calls billing directly and gets guaranteed-fresh data.
+    //    Without this, the cron might load stale Redis data from before the PATCH.
+    try {
+      Bun.spawnSync([
+        'docker', 'exec', 'redis-cluster',
+        'valkey-cli', '-c', '-p', '6000', 'DEL', '{no_version}:gameCodes',
+      ]);
+    } catch { /* non-fatal — falls back to cron-reads-Redis path if eviction fails */ }
   },
 
   /**

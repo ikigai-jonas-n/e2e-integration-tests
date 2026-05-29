@@ -3,11 +3,16 @@ import { E2EOrchestrator } from '../src/E2EOrchestrator';
 import { api } from './utils/api';
 import { BILLING, GAME, SVC_SIG } from './utils/config';
 
-// Import Domain & Flow Tests
-import { runServiceTests } from './specs/service.spec';
+// Unit-test style specs (individual endpoint coverage)
+import { runServiceTests }  from './specs/service.spec';
 import { runInternalTests } from './specs/internal.spec';
-import { runBridgeFlowTests } from './specs/bridge.spec';
-import { runExpTests } from './specs/exp.spec';
+import { runExpTests }      from './specs/exp.spec';
+
+// Flow specs (end-to-end lifecycle tests, each step depends on the previous)
+import { runBetAndActionFlow }     from './specs/bet-n-action-flow.spec';
+import { runLobbyFlowTests }       from './specs/lobby-flow.spec';
+import { runMaintenanceFlowTests } from './specs/maintenance-flow.spec';
+import { runBridgeFlowTests }      from './specs/bridge-flow.spec';
 
 const orchestrator = new E2EOrchestrator();
 
@@ -19,39 +24,48 @@ beforeAll(async () => {
 
   console.log('[setup] Waiting for caches to warm up...');
   let cacheReady = false;
-  for (let i = 0; i < 30; i++) {
+  for (let i = 0; i < 90; i++) {
     try {
       const bRes = await api.get(`${BILLING}/v2/service/games`, { headers: SVC_SIG });
       const gRes = await api.get(`${GAME}/v2/service/games`, { headers: SVC_SIG });
-      
+
       const bGames = bRes.data?.data?.games ?? bRes.data?.data;
       const gGames = gRes.data?.data?.games ?? gRes.data?.data;
-      
-      if (Array.isArray(bGames) && Array.isArray(gGames) && gGames.length > 0) {
+
+      if (Array.isArray(bGames) && bGames.length > 0 && Array.isArray(gGames) && gGames.length > 0) {
+        console.log(`[setup] Both caches ready after ~${i}s (billing: ${bGames.length}, game: ${gGames.length} games)`);
         cacheReady = true;
         break;
+      }
+      if (i > 0 && i % 15 === 0) {
+        const bOk = Array.isArray(bGames) && bGames.length > 0;
+        const gOk = Array.isArray(gGames) && gGames.length > 0;
+        console.log(`[setup] Still waiting... billing=${bOk ? 'ready' : 'empty'}, game=${gOk ? 'ready' : 'empty'}`);
       }
     } catch {}
     await new Promise(r => setTimeout(r, 1000));
   }
-  if (!cacheReady) throw new Error('Timeout waiting for process caches.');
+  if (!cacheReady) throw new Error('Timeout waiting for process caches (billing + game node).');
   console.log('✅ Setup complete.');
 }, 600000);
 
 afterAll(async () => {
   await orchestrator.teardown();
-});
+}, 60000);
 
 // ==========================================
-// REGISTER SUITES (Order Matters!)
+// UNIT-TEST STYLE — individual endpoints
 // ==========================================
+describe('Service APIs   (/v2/service/*)',  runServiceTests);
+describe('Internal APIs  (/v1/internal/*)', runInternalTests);
+describe('Experience APIs (/v2/exp/*)',     runExpTests);
 
-// 1. Check basic health and registry endpoints
-describe('Service APIs (/v2/service/*)', runServiceTests);
-describe('Internal APIs (/v2/internal/*)', runInternalTests);
+// ==========================================
+// FLOW SPECS — full lifecycle tests
+// ==========================================
+describe('Flow: Bet + Action',            runBetAndActionFlow);
+describe('Flow: Lobby Session Token',     runLobbyFlowTests);
+describe('Flow: Game Maintenance',        runMaintenanceFlowTests);
 
-// 2. Test Kafka propagation. This ends by setting LGS-001 to enabled and EUR bet level to 2.
-// describe('Flow: Bridge & State Propagation', runBridgeFlowTests);
-
-// 3. Test actual gameplay now that the environment is proven ready.
-describe('Experience APIs (/v2/exp/*) - Bet Flow', runExpTests);
+// Bridge flow last — it disables / re-enables LGS-001 (may affect cron state)
+describe('Flow: Bridge & State Propagation', runBridgeFlowTests);

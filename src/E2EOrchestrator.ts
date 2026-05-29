@@ -68,8 +68,12 @@ export class E2EOrchestrator {
   private getBuildKey(worktreeDir: string): { commit: string; dirty: string } | null {
     try {
       const commit = execSync('git rev-parse HEAD', { cwd: worktreeDir }).toString().trim();
-      // Hash the diff of the working tree vs HEAD (empty string on a clean tree)
-      const diff = execSync('git diff HEAD', { cwd: worktreeDir }).toString();
+      // Diff only source & package files — exclude docker-compose.yml (orchestrator mutates it
+      // for port remapping, which would otherwise bust the cache on every run).
+      const diff = execSync(
+        'git diff HEAD -- ":(exclude)*docker-compose*" ":(exclude)*.env*"',
+        { cwd: worktreeDir },
+      ).toString();
       // Simple djb2-style hash over the diff text — no external tooling needed
       let h = 5381;
       for (let i = 0; i < diff.length; i++) h = ((h << 5) + h) ^ diff.charCodeAt(i);
@@ -112,7 +116,7 @@ export class E2EOrchestrator {
       const current = this.getBuildKey(worktreeDir);
       if (!current) return 'git error';
       if (saved.commit !== current.commit) return `HEAD changed (${saved.commit.slice(0,7)} → ${current.commit.slice(0,7)})`;
-      if (saved.dirty  !== current.dirty)  return 'uncommitted local changes detected';
+      if (saved.dirty  !== current.dirty)  return 'source files changed (uncommitted)';
       return 'up-to-date';
     } catch { return 'state file unreadable'; }
   }
