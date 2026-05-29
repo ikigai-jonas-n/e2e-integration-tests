@@ -58,16 +58,11 @@ describe('Global E2E Integration Suite', () => {
     const amToken = amTokenRes.data?.data?.token;
     if (!amToken) throw new Error('Failed to obtain AM token during setup.');
 
-    // Phase 1: Wait for BILLING's process cache to be populated.
-    // Billing runs games-collection-sync immediately on startup (reads DB directly).
-    // Must confirm billing is ready before proceeding — the game node falls back to
-    // billing's API when Redis is empty, so billing must have data first.
-   console.log('[setup] Phase 1: waiting for billing process cache...');
+    console.log('[setup] Phase 1: waiting for billing process cache...');
     let billingCacheReady = false;
     for (let i = 0; i < 30; i++) {
       try {
         const r = await api.get(`${BILLING}/v2/service/games`, { headers: SVC_SIG });
-        // FIX: Pierce the wrapper. Fallback to r.data?.data if the API occasionally flattens it.
         const games = r.data?.data?.games ?? r.data?.data; 
         if (Array.isArray(games) && games.length > 0) {
           console.log(`[setup] Billing cache ready after ~${i}s (${games.length} games)`);
@@ -79,16 +74,12 @@ describe('Global E2E Integration Suite', () => {
     }
     if (!billingCacheReady) throw new Error('Timeout: billing process cache never populated.');
 
-    // Phase 2: Wait for GAME NODE's process cache.
-    // Game node is PERIPHERAL: syncs from Redis (bridge → Kafka → Redis) or billing fallback.
-    // Race condition: if game node's first cron ran before billing cache was ready, it saved
-    // 0 games. Next cron fires after ~60s. Poll for up to 90s to catch the retry.
     console.log('[setup] Phase 2: waiting for game node process cache...');
     let gameNodeReady = false;
     for (let i = 0; i < 90; i++) {
       try {
         const r = await api.get(`${GAME}/v2/service/games`, { headers: SVC_SIG });
-        const games = r.data?.data?.games ?? r.data?.data; // FIX HERE TOO
+        const games = r.data?.data?.games ?? r.data?.data;
         if (Array.isArray(games) && games.length > 0) {
           console.log(`[setup] Game node cache ready after ~${i}s (${games.length} games)`);
           gameNodeReady = true;
@@ -99,25 +90,36 @@ describe('Global E2E Integration Suite', () => {
     }
     if (!gameNodeReady) throw new Error('Timeout: game node process cache never populated.');
 
+    // ---> FIX START: FORCE CLEAN STATE <---
+    console.log('[setup] Phase 3: Pushing state resets (Enablement + Bet Levels)...');
+    
+    // Ensure LGS-001 is enabled (in case a previous test run crashed or finished with it disabled)
+    const enableRes = await api.patch(`${BILLING}/v1/internal/games/status`, {
+      data: [{ code: 'LGS-001', enabled: true }],
+    }, { headers: { 'x-access-token': amToken } });
+    if (enableRes.status !== 200) console.warn('[setup] games/status PATCH returned', enableRes.status, enableRes.data);
+
     // Seed EUR bet level "2" for LGS-001 so Flow 1 bet payload is valid
     const patchRes = await api.patch(`${BILLING}/v1/internal/game/LGS-001/betLevels`, {
       currencyCode: 'EUR',
       betLevels: [{ type: 'regular', value: '2', default: true }],
     }, { headers: { 'x-access-token': amToken } });
-    if (patchRes.status !== 200) {
-      console.warn('[setup] betLevels PATCH returned', patchRes.status, patchRes.data);
-    }
+    if (patchRes.status !== 200) console.warn('[setup] betLevels PATCH returned', patchRes.status, patchRes.data);
 
-    // Poll bet-levels until LGS-001 has the EUR bet level we just seeded
+    // Poll until LGS-001 is enabled on the GAME node AND has the EUR bet level on BILLING
     let synced = false;
     for (let i = 0; i < 30; i++) {
       try {
-        const r = await api.get(`${BILLING}/v2/service/games/bet-levels?gameCode=LGS-001`, { headers: SVC_SIG });
-        const betLevels = r.data?.data;
+        // 1. Check bet levels on Billing
+        const betRes = await api.get(`${BILLING}/v2/service/games/bet-levels?gameCode=LGS-001`, { headers: SVC_SIG });
+        const betLevels = betRes.data?.data;
         
-        // The bet-levels API returns a dictionary of currencies mapped to arrays
-        if (betLevels && Array.isArray(betLevels['EUR'])) {
-          // Check if our patched value '2' successfully propagated
+        // 2. Check enablement status on Game node
+        const gameRes = await api.get(`${GAME}/v2/service/games`, { headers: SVC_SIG });
+        const games = gameRes.data?.data?.games ?? gameRes.data?.data;
+        const game = games?.find((g: any) => g.code === 'LGS-001');
+        
+        if (game?.enabled === true && betLevels && Array.isArray(betLevels['EUR'])) {
           const hasSeededValue = betLevels['EUR'].some((b: any) => b.value === '2');
           if (hasSeededValue) {
             synced = true; 
@@ -127,11 +129,11 @@ describe('Global E2E Integration Suite', () => {
       } catch { /* ignore during polling */ }
       await new Promise(r => setTimeout(r, 1000));
     }
-    if (!synced) throw new Error('Timeout waiting for game bet levels to synchronize.');
+    if (!synced) throw new Error('Timeout waiting for game bet levels and enablement to synchronize.');
+    // ---> FIX END <---
 
-    // Extra wait for the betLevels Kafka event to reach game node process cache
     await new Promise(r => setTimeout(r, 3000));
-    console.log('✅ Setup complete. LGS-001 ready on all nodes.');
+    console.log('✅ Setup complete. LGS-001 cleanly enabled and ready on all nodes.');
   }, 600000);
 
   afterAll(async () => {
@@ -214,7 +216,7 @@ describe('Global E2E Integration Suite', () => {
         gameCode: 'LGS-001',
         lang: 'en',
         country: 'GB',
-        gameSetting: { rtpConfigCode: 'lowRTP', isGeoBlocking: true, jurisdictionCode: 'slotJD' },
+        gameSetting: { rtpConfigCode: 'highRTP', isGeoBlocking: true, jurisdictionCode: 'slotJD' },
         mode: 'real',
         operator: 'QARealGameOperator',
         brand: 'QARealGameBrand',
@@ -302,9 +304,9 @@ describe('Global E2E Integration Suite', () => {
       // Run a second independent session to test the complete round lifecycle cleanly
       const startRes = await api.post(`${GAME}/v2/service/session/start`, {
         gameCode: 'LGS-001', lang: 'en', country: 'GB',
-        gameSetting: { rtpConfigCode: 'lowRTP', isGeoBlocking: true, jurisdictionCode: 'slotJD' },
+        gameSetting: { rtpConfigCode: 'highRTP', isGeoBlocking: true, jurisdictionCode: 'slotJD' },
         mode: 'real', operator: 'QARealGameOperator', brand: 'QARealGameBrand',
-        playerId: 'QARealGameOperator:QARealGameBrand:kyle0c2', externalPlayerId: 'kyle0c2',
+        playerId: 'QARealGameOperator:QARealGameBrand:kyle0c', externalPlayerId: 'kyle0c',
         currency: 'EUR', currencyId: 1, balance: '10000', maxExposure: 0,
         isTestingPlayer: false, licenseConfig: {}, callback: 'http://localhost',
       }, { headers: SVC_SIG });
@@ -388,21 +390,46 @@ describe('Global E2E Integration Suite', () => {
     });
 
     it('Step 3: Game node reflects disabled state after Kafka propagation', async () => {
-      // Allow time for: billing Kafka publish → bridge receives → bridge updates Redis → game node cron picks up
-      await new Promise(r => setTimeout(r, 5000));
+      let isGameDisabled = false;
 
-      const res = await api.get(`${GAME}/v2/service/games`, { headers: SVC_SIG });
-      expect(res.status).toBe(200);
-      const games = res.data?.data?.games ?? res.data?.data; // FIX
-      const game = games?.find((g: any) => g.code === 'LGS-001');
-      expect(game?.enabled).toBe(false);
-    });
+      // ⏳ FIX: Game node syncs via cron every 60s. We must poll up to 75s.
+      for (let i = 0; i < 75; i++) {
+        const res = await api.get(`${GAME}/v2/service/games`, { headers: SVC_SIG });
+        const games = res.data?.data?.games ?? res.data?.data; 
+        const game = games?.find((g: any) => g.code === 'LGS-001');
+
+        if (game && game.enabled === false) {
+          isGameDisabled = true;
+          break; // State successfully pulled from Redis by the cron job!
+        }
+        await new Promise(r => setTimeout(r, 1000));
+      }
+
+      expect(isGameDisabled).toBe(true);
+    }, 90000); // 👈 Note the 90s timeout override for this specific test
 
     it('Step 4: Re-enable LGS-001 (restore state)', async () => {
       const res = await api.patch(`${BILLING}/v1/internal/games/status`, {
         data: [{ code: 'LGS-001', enabled: true }],
       }, { headers: { 'x-access-token': amToken } });
       expect(res.status).toBe(200);
-    });
+      
+      let isGameEnabled = false;
+
+      // ⏳ FIX: Wait for the cron job to restore the state for future runs
+      for (let i = 0; i < 75; i++) {
+        const checkRes = await api.get(`${GAME}/v2/service/games`, { headers: SVC_SIG });
+        const games = checkRes.data?.data?.games ?? checkRes.data?.data; 
+        const game = games?.find((g: any) => g.code === 'LGS-001');
+
+        if (game && game.enabled === true) {
+          isGameEnabled = true;
+          break; 
+        }
+        await new Promise(r => setTimeout(r, 1000));
+      }
+
+      expect(isGameEnabled).toBe(true);
+    }, 90000); // 👈 Timeout override here too
   });
 });

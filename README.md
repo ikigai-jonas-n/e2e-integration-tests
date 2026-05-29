@@ -88,7 +88,7 @@ bun test
        → git pull all service repos (skipped if E2E_SKIP_PULL=1)
        → auto-detect warm start
   └─ E2EOrchestrator.startInfrastructure()     ← skipped on warm start
-       → docker-compose up (Kafka, Postgres, MongoDB, Redis, RustFS)
+       → docker compose up (Kafka, Postgres, MongoDB, Redis, RustFS)
   └─ E2EOrchestrator.runGlobalMigrations()     ← skipped on warm start
        → @ikigaians/migrate up (Postgres schema, MongoDB indexes)
   └─ E2EOrchestrator.runServices()             ← skipped on warm start

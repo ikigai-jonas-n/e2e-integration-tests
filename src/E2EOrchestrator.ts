@@ -266,7 +266,7 @@ export class E2EOrchestrator {
         if (fs.existsSync(path.join(targetDir, '.git'))) {
           console.log(`   -> Pulling latest for ${service} @ ${data.target}...`);
           if (fs.existsSync(path.join(targetDir, 'docker-compose.yml'))) {
-            Bun.spawnSync(['docker-compose', 'down', '-v', '--remove-orphans'], { cwd: targetDir });
+            Bun.spawnSync(['docker', 'compose', 'down', '-v', '--remove-orphans'], { cwd: targetDir });
           }
           await this.runAsync('git reset --hard HEAD', targetDir);
           await this.runAsync(`git pull origin ${data.target}`, targetDir);
@@ -320,11 +320,11 @@ export class E2EOrchestrator {
         this.writeComposeOverride(dir, this.network, svcData?.composeServiceEnvOverrides ?? {});
       }
 
-      await this.runAsync('docker-compose up -d', dir);
+      await this.runAsync('docker compose up -d', dir);
     }));
 
-    console.log('⏳ Waiting 10 seconds for Databases to initialize...');
-    await new Promise(r => setTimeout(r, 10000));
+    console.log('⏳ Waiting 15 seconds for Databases and Kafka to initialize...');
+    await new Promise(r => setTimeout(r, 15000));
   }
 
   async runGlobalMigrations() {
@@ -478,12 +478,22 @@ export class E2EOrchestrator {
       try { proc.kill('SIGKILL'); } catch (e) {}
     });
 
+    // ASSASSINATE ORPHANED NODE PROCESSES (Excluding ourselves)
+    const ports = this.portsToClear;
+    const myPid = process.pid; // Prevent suicide
+    console.log(`   🧹 Clearing orphaned processes on ports: [${ports.join(', ')}]`);
+    for (const port of ports) {
+      try {
+        execSync(`lsof -t -i:${port} | grep -v '^${myPid}$' | xargs kill -9 2>/dev/null || true`);
+      } catch (e) {}
+    }
+
     if (fs.existsSync(this.worktreeBase)) {
       for (const [service, data] of Object.entries(config.services)) {
         const dir = path.join(this.worktreeBase, service);
         if (fs.existsSync(path.join(dir, 'docker-compose.yml'))) {
           try {
-            Bun.spawnSync(['docker-compose', 'down', '-v', '--remove-orphans'], { cwd: dir });
+            Bun.spawnSync(['docker', 'compose', 'down', '-v', '--remove-orphans'], { cwd: dir });
           } catch (e) {}
         }
         if (config.global.cleanOnTeardown) {
