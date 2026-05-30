@@ -1,6 +1,6 @@
 import { expect, it } from 'bun:test';
 import { api, logError, logWarn } from '../utils/api';
-import { GAME, SVC_SIG } from '../utils/config';
+import { GAME_URL, SERVICE_SIGNATURE, TARGET_RTP_CODE } from '../utils/config';
 
 export function runExpTests() {
   let launchToken = '';
@@ -13,13 +13,12 @@ export function runExpTests() {
 
   it('Prerequisite: Creates a Session (/v2/service/session/start)', async () => {
     const res = await api.post(
-      `${GAME}/v2/service/session/start`,
+      `${GAME_URL}/v2/service/session/start`,
       {
         gameCode: 'LGS-004',
         lang: 'en',
         country: 'GB',
-        gameSetting: { rtpConfigCode: 'RTP_97', isGeoBlocking: true, jurisdictionCode: 'slotJD' },
-        mode: 'real',
+gameSetting: { rtpConfigCode: TARGET_RTP_CODE, isGeoBlocking: true, jurisdictionCode: 'slotJD' },        mode: 'real',
         operator: 'QARealGameOperator',
         brand: 'QARealGameBrand',
         playerId: PLAYER_ID,
@@ -32,7 +31,7 @@ export function runExpTests() {
         licenseConfig: {},
         callback: 'http://localhost',
       },
-      { headers: SVC_SIG },
+      { headers: SERVICE_SIGNATURE },
     );
 
     expect(res.status).toBe(200);
@@ -45,7 +44,7 @@ export function runExpTests() {
   });
 
   it('Activates Session (/v2/exp/session/activate)', async () => {
-    const res = await api.post(`${GAME}/v2/exp/session/activate`, {
+    const res = await api.post(`${GAME_URL}/v2/exp/session/activate`, {
       token: launchToken,
       ts: Date.now(),
       timezone: 'Asia/Taipei',
@@ -65,7 +64,7 @@ export function runExpTests() {
 
   it('Places a Bet (/v2/exp/play/bet)', async () => {
     const res = await api.post(
-      `${GAME}/v2/exp/play/bet`,
+      `${GAME_URL}/v2/exp/play/bet`,
       {
         session: sessionId,
         bet: { type: 'regular', value: '2' },
@@ -96,7 +95,7 @@ export function runExpTests() {
 
   it('Finishes the Round (/v2/exp/play/finish)', async () => {
     const res = await api.post(
-      `${GAME}/v2/exp/play/finish`,
+      `${GAME_URL}/v2/exp/play/finish`,
       {
         session: sessionId,
         roundId,

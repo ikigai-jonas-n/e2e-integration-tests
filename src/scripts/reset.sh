@@ -20,8 +20,8 @@ for dir in "$WORKTREE_BASE/queue-service" "$WORKTREE_BASE/remote-game-server"; d
     docker compose -f "$dir/docker-compose.yml" down -v --remove-orphans --timeout 5 2>/dev/null || true
   fi
 done
-if [ -f "docker-compose.observability.yml" ]; then
-  docker compose -f docker-compose.observability.yml down -v --timeout 5 2>/dev/null || true
+if [ -f "src/docker-compose.observability.yml" ]; then
+  docker compose -f src/docker-compose.observability.yml down -v --timeout 5 2>/dev/null || true
 fi
 
 echo "🐳 Annihilating Orphaned Containers..."
@@ -45,8 +45,9 @@ if [ -d "$WORKTREE_BASE" ]; then
     fi
   done
   
-  echo "   Deleting $WORKTREE_BASE (using Docker to bypass Root/WiredTiger locks)..."
-  docker run --rm -v "$(pwd):/workspace" alpine sh -c "rm -rf /workspace/$WORKTREE_BASE"
+  # --- REPLACE THE DOCKER COMMAND WITH THIS ---
+  echo "   Deleting $WORKTREE_BASE (natively)..."
+  rm -rf "$WORKTREE_BASE"
 fi
 
 echo "🗑️  Clearing build caches..."

@@ -1,27 +1,29 @@
-# E2E Orchestrator configuration
-# Defines how the test harness provisions, builds, and manages services.
-# Service runtime config (command, ports, env, depends_on) lives in docker-compose.services.yml.
-
 global:
   # Where git worktrees for each repo are checked out
   worktreeBasePath: "./.e2e-worktrees"
 
-  # Keep services running after bun test finishes.
-  # Next run detects healthy services + unchanged code → warm start (~5s total).
-  # Set to true or pass E2E_TEARDOWN=1 to force full teardown after a run.
   cleanOnTeardown: false
-
-  # Service log verbosity in the terminal:
-  #   false    — service logs go to log files only (default, clean terminal)
-  #   "errors" — service stderr also printed to terminal (shows crashes)
-  #   true     — all service stdout+stderr printed to terminal
   verbose: false
-
-  # Docker network mode for Node services:
-  #   null      — host networking (default, simplest, recommended for local dev)
-  #   "e2e-net" — bridge mode (services talk via container names instead of 127.0.0.1)
-  #               NOTE: bridge mode has a known Redis cluster issue; see HANDOVER.md
   network: null
+
+  # Defines the target game and RTP band for the test suite. 
+  # All tests, clients, and API helpers sync to these values.
+  testConfig:
+    targetGameCode: "LGS-004"
+    targetRtpCode: "RTP_97"
+
+  # Suites to permanently skip by default (e.g. slow Kafka propagation flows)
+  # Slugs: service-apis, internal-apis, experience-apis, flow-bet-action, 
+  #        flow-lobby, flow-maintenance, flow-bridge
+  skipSuites:
+    - internal-apis
+    - flow-bridge
+
+  # Global data flushing defaults on startup
+  flushData:
+    redis: true      # Clears deduced Redis namespaces
+    mongo: true      # Drops deduced Mongo databases
+    postgres: false  # Runs 'migrate down all'. Default false to speed up local boots.
 
 # Git repos to check out as worktrees before starting services.
 # target can be a branch name OR a version tag — both are supported.
@@ -46,12 +48,16 @@ repos:
 
   remote-game-server:
     repoPath: "../remote-game-server"
-    target: "main"                          # game-activity, job-stale-rounds, job-close-inactive
+    target: "1.15.1"                          # game-activity, job-stale-rounds, job-close-inactive
     migrationEnvFile: ".env.billing.example"  # first svc (game-activity) has no DB credentials
     envOverrides:
       DB_NAME: "slot_main"
       MONGO_NAME: "rgs_main"
+    # Example of a granular override:
+    # flushData:
+    #   mongo: false
     alwaysRedoMigration: false
+    skipMigration: true
 
   remote-game-server-billing:
     repoPath: "../remote-game-server"
@@ -65,6 +71,7 @@ repos:
     target: "1.8.0"                         # bridge
     alwaysRedoMigration: false
     migrationEnvFile: ".env.billing.example"  # bridge env has no DB credentials
+    skipMigration: true
 
   remote-game-server-game:
     repoPath: "../remote-game-server"

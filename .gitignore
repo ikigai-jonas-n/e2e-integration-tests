@@ -56,3 +56,5 @@ Icon
 dist/
 build/
 *.tsbuildinfo
+
+/docs

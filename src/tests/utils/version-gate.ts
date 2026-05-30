@@ -42,9 +42,11 @@ type OrchestratorConfig = {
 };
 type ComposeFile = { services?: Record<string, { 'x-repo'?: string }> };
 
-const orch = parseYaml(fs.readFileSync('./e2e-orchestrator.yml', 'utf-8')) as OrchestratorConfig;
+const orch = parseYaml(
+  fs.readFileSync('./src/e2e-orchestrator.yml', 'utf-8'),
+) as OrchestratorConfig;
 const composed = parseYaml(
-  fs.readFileSync('./docker-compose.services.yml', 'utf-8'),
+  fs.readFileSync('./src/docker-compose.services.yml', 'utf-8'),
 ) as ComposeFile;
 
 const worktreeBase = path.resolve(orch.global.worktreeBasePath);

@@ -41,6 +41,7 @@ services:
   # ── remote-game-server ──────────────────────────────────────────────────────
   billing:
     x-repo: remote-game-server
+    # x-repo: remote-game-server-billing
     x-env-file: .env.billing.example
     x-setup:
       - npm install
@@ -74,8 +75,76 @@ services:
       timeout: 3s
       retries: 30
 
+  game:
+      x-repo: remote-game-server
+      # x-repo: remote-game-server-game
+      x-env-file: .env.game.example
+      x-setup:
+        - npm install
+        - npm run build
+      x-bridge-env:
+        QUEUE_HOST_NAMES: "kafka-region:9093"
+        GLOBAL_QUEUE_HOST_NAMES: "kafka-global:9193"
+        REDIS_HOST: redis-cluster
+        JOB_LOCKER_HOST: redis-cluster
+        MONGO_HOST: mongo-primary
+        MONGO_PORT: "27017"
+        CORE_SLOT_RGS_SERVICE_URL: "http://billing:8080"
+        SLOT_GAME_SERVICE_URL: "http://sgs-core:9000"
+        SLOT_GAME_ACTIVITY_SERVICE_URL: "http://game-activity:8070"
+
+      command: node --enable-source-maps build/index.js
+      environment:
+        NODE_PATH: ./build
+        CORE_SLOT_RGS_SERVICE_URL: "http://127.0.0.1:8080"
+        SLOT_GAME_SERVICE_URL: "http://127.0.0.1:9000"
+        SLOT_GAME_ACTIVITY_SERVICE_URL: "http://127.0.0.1:8070"
+        MONEY_SERVICE_URL: "https://money-service.iki-cit.cc"
+        PLAYER_SERVICE_URL: "https://player-service.iki-cit.cc"
+        API_HUB_SERVICE_URL: "https://api-hub-gs1.iki-cit.cc"
+      ports:
+        - "19080:19080"
+      depends_on:
+        billing:
+          condition: service_healthy
+        sgs-core:
+          condition: service_healthy
+        game-activity:
+          condition: service_healthy
+      healthcheck:
+        test: ["CMD", "curl", "-sf", "http://127.0.0.1:19080/v2/service/healthcheck"]
+        interval: 2s
+        timeout: 3s
+        retries: 30
+
+  bridge:
+      x-repo: remote-game-server
+      # x-repo: remote-game-server-bridge
+      x-env-file: .env.bridge.example
+      x-setup:
+        - npm install
+        - npm run build
+      x-bridge-env:
+        QUEUE_HOST_NAMES: "kafka-region:9093"
+        GLOBAL_QUEUE_HOST_NAMES: "kafka-global:9193"
+        REDIS_HOST: redis-cluster
+        CORE_SLOT_RGS_SERVICE_URL: "http://billing:8080"
+
+      command: node --enable-source-maps build/index.js
+      environment:
+        NODE_PATH: ./build
+        RGS_PORT: "7001"
+        CORE_SLOT_RGS_SERVICE_URL: "http://127.0.0.1:8080"
+      ports:
+        - "7001:7001"
+      # Waits for billing healthcheck before spawning — replaces `while ! curl` bash hack
+      depends_on:
+        billing:
+          condition: service_healthy
+
   game-activity:
-    x-repo: remote-game-server     # main branch — triggers build for jobs too
+    x-repo: remote-game-server
+    # x-repo: remote-game-server-no-db     # main branch — triggers build for jobs too
     x-env-file: .env.game-activity.example
     x-setup:
       - npm install
@@ -96,32 +165,9 @@ services:
       timeout: 3s
       retries: 30
 
-  bridge:
-    x-repo: remote-game-server
-    x-env-file: .env.bridge.example
-    x-setup:
-      - npm install
-      - npm run build
-    x-bridge-env:
-      QUEUE_HOST_NAMES: "kafka-region:9093"
-      GLOBAL_QUEUE_HOST_NAMES: "kafka-global:9193"
-      REDIS_HOST: redis-cluster
-      CORE_SLOT_RGS_SERVICE_URL: "http://billing:8080"
-
-    command: node --enable-source-maps build/index.js
-    environment:
-      NODE_PATH: ./build
-      RGS_PORT: "7001"
-      CORE_SLOT_RGS_SERVICE_URL: "http://127.0.0.1:8080"
-    ports:
-      - "7001:7001"
-    # Waits for billing healthcheck before spawning — replaces `while ! curl` bash hack
-    depends_on:
-      billing:
-        condition: service_healthy
-
   job-stale-rounds:
     x-repo: remote-game-server
+    # x-repo: remote-game-server-no-db
     x-env-file: .env.job.example
     x-bridge-env:
       QUEUE_HOST_NAMES: "kafka-region:9093"
@@ -145,6 +191,7 @@ services:
 
   job-close-inactive:
     x-repo: remote-game-server
+    # x-repo: remote-game-server-no-db
     x-env-file: .env.job.example
     x-bridge-env:
       QUEUE_HOST_NAMES: "kafka-region:9093"
@@ -165,47 +212,6 @@ services:
         condition: service_healthy
       sgs-core:
         condition: service_healthy
-
-  game:
-    x-repo: remote-game-serv
-    x-env-file: .env.game.example
-    x-setup:
-      - npm install
-      - npm run build
-    x-bridge-env:
-      QUEUE_HOST_NAMES: "kafka-region:9093"
-      GLOBAL_QUEUE_HOST_NAMES: "kafka-global:9193"
-      REDIS_HOST: redis-cluster
-      JOB_LOCKER_HOST: redis-cluster
-      MONGO_HOST: mongo-primary
-      MONGO_PORT: "27017"
-      CORE_SLOT_RGS_SERVICE_URL: "http://billing:8080"
-      SLOT_GAME_SERVICE_URL: "http://sgs-core:9000"
-      SLOT_GAME_ACTIVITY_SERVICE_URL: "http://game-activity:8070"
-
-    command: node --enable-source-maps build/index.js
-    environment:
-      NODE_PATH: ./build
-      CORE_SLOT_RGS_SERVICE_URL: "http://127.0.0.1:8080"
-      SLOT_GAME_SERVICE_URL: "http://127.0.0.1:9000"
-      SLOT_GAME_ACTIVITY_SERVICE_URL: "http://127.0.0.1:8070"
-      MONEY_SERVICE_URL: "https://money-service.iki-cit.cc"
-      PLAYER_SERVICE_URL: "https://player-service.iki-cit.cc"
-      API_HUB_SERVICE_URL: "https://api-hub-gs1.iki-cit.cc"
-    ports:
-      - "19080:19080"
-    depends_on:
-      billing:
-        condition: service_healthy
-      sgs-core:
-        condition: service_healthy
-      game-activity:
-        condition: service_healthy
-    healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:19080/v2/service/healthcheck"]
-      interval: 2s
-      timeout: 3s
-      retries: 30
 
 # NOTE: Observability tools (Seq, Dozzle) live in docker-compose.observability.yml.
 # They are started separately because this file contains native Bun-spawned services

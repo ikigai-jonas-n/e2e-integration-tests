@@ -6,11 +6,18 @@ import { parse as parseYaml } from 'yaml';
 
 // ─── e2e-orchestrator.yml types ───────────────────────────────────────────────
 
+interface FlushDataConfig {
+  redis?: boolean;
+  mongo?: boolean;
+  postgres?: boolean;
+}
+
 interface OrchestratorGlobal {
   worktreeBasePath: string;
   cleanOnTeardown: boolean;
   verbose: boolean | 'errors';
   network: string | null;
+  flushData?: FlushDataConfig; // <-- ADDED
 }
 
 interface RepoConfig {
@@ -18,9 +25,10 @@ interface RepoConfig {
   target: string;
   migrationEnvFile?: string;
   envOverrides?: Record<string, string>;
-  skipMigration?: boolean; // New
-  alwaysRedoMigration?: boolean; // New
-  untilMigrationFile?: string; // New
+  skipMigration?: boolean;
+  alwaysRedoMigration?: boolean;
+  untilMigrationFile?: string;
+  flushData?: FlushDataConfig; // <-- ADDED
 }
 
 interface ObservabilityConfig {
@@ -52,11 +60,11 @@ interface ComposeService {
 // ─── Load configs ─────────────────────────────────────────────────────────────
 
 const orchestratorCfg = parseYaml(
-  readFileSync(path.resolve('./e2e-orchestrator.yml'), 'utf-8'),
+  readFileSync(path.resolve('./src/e2e-orchestrator.yml'), 'utf-8'),
 ) as OrchestratorConfig;
 
 const composeServices = (
-  parseYaml(readFileSync(path.resolve('./docker-compose.services.yml'), 'utf-8')) as {
+  parseYaml(readFileSync(path.resolve('./src/docker-compose.services.yml'), 'utf-8')) as {
     services: Record<string, ComposeService>;
   }
 ).services;
@@ -227,6 +235,7 @@ class SeqForwarder {
 
 export class E2EOrchestrator {
   private activeProcesses: any[] = [];
+  private streamControllers: AbortController[] = []; // <-- ADD THIS
   private _changedRepos = new Set<string>(); // <-- ADD THIS
   private worktreeBase = path.resolve(orchestratorCfg.global.worktreeBasePath);
   private npmCacheDir = path.resolve('./.e2e-npm-cache');
@@ -370,12 +379,12 @@ export class E2EOrchestrator {
       const svcDir = path.join(this.worktreeBase, repo);
       if (!fs.existsSync(path.join(svcDir, '.git'))) continue;
       const status = this.buildCacheStatus(svcDir);
-    const cached = status === 'up-to-date';
-    if (!cached) {
-      allCached = false;
-      this._changedRepos.add(repo); // <-- ADD THIS
-    }
-    console.log(`   ${repo.padEnd(24)} ${cached ? '⚡ cached' : `🔄 ${status}`}`);
+      const cached = status === 'up-to-date';
+      if (!cached) {
+        allCached = false;
+        this._changedRepos.add(repo); // <-- ADD THIS
+      }
+      console.log(`   ${repo.padEnd(24)} ${cached ? '⚡ cached' : `🔄 ${status}`}`);
     }
 
     this._warmStart = servicesHealthy && allCached;
@@ -440,27 +449,51 @@ export class E2EOrchestrator {
    * Deduce the isolated DB names for a specific repo variant.
    * Suffix-based isolation ensures that 'bridge', 'game', etc., get their own logical DBs.
    */
-  private deduceIsolatedNames(repoName: string, repoCfg?: RepoConfig) {
+private deduceIsolatedNames(repoName: string, repoCfg?: RepoConfig, svc?: ComposeService) {
     const defaultDb = 'slot';
     const defaultMongo = 'rgs';
+    const defaultRedis = 'slot-rgs';
 
     let dbName = repoCfg?.envOverrides?.DB_NAME;
     let mongoName = repoCfg?.envOverrides?.MONGO_NAME;
+    let redisPrefix = repoCfg?.envOverrides?.REDIS_PREFIX;
 
-    if (!dbName || !mongoName) {
+    if (!dbName || !mongoName || !redisPrefix) {
+      // Put your exact database suffix logic back
       const parts = repoName.split('-');
       const suffix = parts.length > 1 ? parts[parts.length - 1] : '';
 
-      // Billing is the architectural root; other suffixes get isolated namespaces.
-      if (suffix && !['billing', 'server', 'service'].includes(suffix)) {
-        dbName = dbName || `${defaultDb}_${suffix}`;
-        mongoName = mongoName || `${defaultMongo}_${suffix}`;
-      } else {
-        dbName = dbName || defaultDb;
-        mongoName = mongoName || defaultMongo;
+      dbName = dbName || `${defaultDb}_${suffix}`;
+      mongoName = mongoName || `${defaultMongo}_${suffix}`;
+
+      // Smartly deduce Redis based on APP_CLOUD_REGION_TYPE
+      if (!redisPrefix) {
+        let regionType = 'peripheral'; // default to gamesite
+
+        if (svc) {
+          const svcEnv = parseEnv(svc.environment);
+          if (svcEnv.APP_CLOUD_REGION_TYPE) {
+            regionType = svcEnv.APP_CLOUD_REGION_TYPE;
+          } else {
+            // Peek into the .env file to grab the region type
+            const envFile = svc['x-env-file'] || repoCfg?.migrationEnvFile;
+            if (envFile) {
+              const envPath = path.join(this.worktreeBase, repoName, envFile);
+              if (fs.existsSync(envPath)) {
+                const content = fs.readFileSync(envPath, 'utf-8');
+                const match = content.match(/^APP_CLOUD_REGION_TYPE\s*=\s*["']?([^"'\n\r]+)["']?/m);
+                if (match) regionType = match[1];
+              }
+            }
+          }
+        }
+
+        // Map region types directly to your shared prefixes
+        redisPrefix = regionType === 'billing' ? `${defaultRedis}_billing` : `${defaultRedis}_game`;
       }
     }
-    return { dbName, mongoName };
+    
+    return { dbName, mongoName, redisPrefix };
   }
 
   /**
@@ -500,14 +533,24 @@ export class E2EOrchestrator {
           const idx = t.indexOf('=');
           if (idx !== -1) {
             const k = t.slice(0, idx).trim();
-            const v = t.slice(idx + 1).trim();
+            let v = t.slice(idx + 1).trim();
+            
+            // --- ADD THESE TWO LINES TO STRIP QUOTES ---
+            if (v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
+            else if (v.startsWith("'") && v.endsWith("'")) v = v.slice(1, -1);
+
             if (k) fileEnv[k] = v;
           }
         }
       });
     }
 
-    const { dbName, mongoName } = this.deduceIsolatedNames(repoName, repoCfg);
+    const { dbName, mongoName, redisPrefix } = this.deduceIsolatedNames(repoName, repoCfg,svc);
+
+    // --- ADD THIS LOGIC TO DEDUCE VERSION ---
+    // If target is a semver tag (e.g., 1.15.1), use it. 
+    // If it's a branch or SHA, you might want a fallback or the raw string.
+    const version = repoCfg?.target || 'v1'; 
 
     // Merge everything
     const merged: Record<string, string> = {
@@ -518,6 +561,8 @@ export class E2EOrchestrator {
       ...(repoCfg?.envOverrides ?? {}),
       DB_NAME: dbName,
       MONGO_NAME: mongoName,
+      REDIS_PREFIX: redisPrefix,
+      VERSION: version, // <-- AUTO-INJECT VERSION HERE
     };
 
     // Construct Postgres URL - Using deducing logic for missing pieces
@@ -536,9 +581,6 @@ export class E2EOrchestrator {
       mUser && mPass
         ? `mongodb://${mUser}:${mPass}@${mHost}:${mPort}/${mongoName}?authSource=admin`
         : `mongodb://${mHost}:${mPort}/${mongoName}`;
-
-    // Log the build for debugging
-    console.log(`🛠️  Env Built: ${repoName} | DB: ${dbName} | Port: ${dbPort}`);
 
     return merged;
   }
@@ -607,22 +649,29 @@ export class E2EOrchestrator {
         Object.entries(orchestratorCfg.repos).map(async ([repoName, repo]) => {
           const targetDir = path.join(this.worktreeBase, repoName);
           const repoPath = path.resolve(repo.repoPath);
+
           if (fs.existsSync(path.join(targetDir, '.git'))) {
             console.log(`   -> Updating ${repoName} @ ${repo.target}...`);
             await this.runAsync('git fetch --all --tags', targetDir);
             try {
-              await this.runAsync(`git reset --hard origin/${repo.target}`, targetDir);
+              // Try to checkout the latest remote branch tip in a detached state
+              await this.runAsync(`git checkout --detach origin/${repo.target}`, targetDir);
             } catch {
-              await this.runAsync(`git checkout ${repo.target}`, targetDir);
+              // Fallback: If it's a Tag or a Commit SHA (short or full), this will succeed
+              await this.runAsync(`git checkout --detach ${repo.target}`, targetDir);
             }
           } else {
             console.log(`   -> Checking out ${repoName} @ ${repo.target}...`);
             if (fs.existsSync(targetDir)) fs.rmSync(targetDir, { recursive: true, force: true });
+            
             await this.runAsync('git fetch --all --tags', repoPath);
             try {
               await this.runAsync('git worktree prune', repoPath);
             } catch {}
-            await this.runAsync(`git worktree add -f ${targetDir} ${repo.target}`, repoPath);
+            
+            // The --detach flag forces a detached HEAD. This safely accepts branch names,
+            // tags, and any short/full SHA without creating local tracking branch conflicts!
+            await this.runAsync(`git worktree add --detach ${targetDir} ${repo.target}`, repoPath);
           }
         }),
       );
@@ -655,14 +704,22 @@ export class E2EOrchestrator {
     );
     try {
       const result = Bun.spawnSync(
-        ['docker', 'compose', '-f', './docker-compose.observability.yml', 'up', '-d', ...toStart],
+        [
+          'docker',
+          'compose',
+          '-f',
+          './src/src/docker-compose.observability.yml',
+          'up',
+          '-d',
+          ...toStart,
+        ],
         { stdout: 'inherit', stderr: 'inherit' },
       );
       if (result.exitCode !== 0) {
         console.warn(
           '   ⚠️  Observability startup failed (non-fatal) — run manually to see error:',
         );
-        console.warn('       docker compose -f docker-compose.observability.yml up -d');
+        console.warn('       docker compose -f src/docker-compose.observability.yml up -d');
       }
     } catch (e: any) {
       console.warn(
@@ -758,7 +815,10 @@ export class E2EOrchestrator {
   }
 
   async runGlobalMigrations() {
-    const hasForcedRedo = Object.values(orchestratorCfg.repos).some((r) => r.alwaysRedoMigration);
+    this.printEnvironmentSummary();
+
+    const targetsToRedo = this.flushDatabases();
+    const hasForcedRedo = Object.values(orchestratorCfg.repos).some((r) => r.alwaysRedoMigration) || targetsToRedo.size > 0;
 
     if (this._warmStart && !hasForcedRedo) {
       console.log('⚡ Warm start: skipping migrations.');
@@ -780,29 +840,11 @@ export class E2EOrchestrator {
       if (repoCfg?.skipMigration === true || !fs.existsSync(migrationsDir)) continue;
       reposMigrated.add(repo);
 
-      const { dbName, mongoName } = this.deduceIsolatedNames(repo, repoCfg);
+      const { dbName, mongoName } = this.deduceIsolatedNames(repo, repoCfg,svc);
       const migrationEnv = this.buildEnvironment(worktreeDir, svc, repo, repoCfg, true);
 
-      // Write the clean .env for migrate.sh
-      const minimalEnvKeys = [
-        'DB_USER',
-        'DB_PASSWORD',
-        'DB_HOST',
-        'DB_PORT',
-        'DB_NAME',
-        'MONGO_USER',
-        'MONGO_PASSWORD',
-        'MONGO_HOST',
-        'MONGO_PORT',
-        'MONGO_NAME',
-        'MONGO_URL',
-        'DATABASE_URL',
-      ];
-      const minimalEnvContent = minimalEnvKeys
-        .filter((k) => migrationEnv[k])
-        .map((k) => `${k}=${migrationEnv[k]}`)
-        .join('\n');
-      fs.writeFileSync(path.join(worktreeDir, '.env'), minimalEnvContent);
+      // --- REPLACE THE MINIMAL ENV HACK WITH THIS ---
+      this.writePhysicalEnvFile(worktreeDir, migrationEnv);
 
       // Release locks if redo is needed
       if (this._warmStart && repoCfg?.alwaysRedoMigration) {
@@ -837,8 +879,11 @@ export class E2EOrchestrator {
           this.createCappedMigrationDir(sourcePath, targetPath, repoCfg.untilMigrationFile);
         }
 
-        // REDO Logic - CHANGE the condition here:
-        if (repoCfg?.alwaysRedoMigration || this._changedRepos.has(repo)) {
+        // REDO Logic - Triggered by YAML flushData, alwaysRedoMigration, or a cache-miss
+        // Notice this now cleanly checks target.name (e.g., slot_main) so it never wipes the wrong DB!
+        const targetNeedsRedo = repoCfg?.alwaysRedoMigration || targetsToRedo.has(target.name) || this._changedRepos.has(repo);
+        
+        if (targetNeedsRedo) {
           console.log(`   -> [REDO] Wiping ${target.name}...`);
           Bun.spawnSync([migrateBin, 'down', target.name, 'all'], {
             cwd: worktreeDir,
@@ -862,6 +907,8 @@ export class E2EOrchestrator {
   }
 
   async runServices() {
+    this.flushRedis(); // <-- Execute cluster flush before any node process starts!
+
     const seqEnabled = !!orchestratorCfg.observability?.seq;
 
     if (this._warmStart) {
@@ -907,6 +954,10 @@ export class E2EOrchestrator {
             }
             const repoCfg = orchestratorCfg.repos[repo];
             const mergedEnv = this.buildEnvironment(worktreeDir, svc, repo, repoCfg);
+            
+            // --- ADD THIS HERE ---
+            this.writePhysicalEnvFile(worktreeDir, mergedEnv);
+
             for (const cmd of setupCmds) {
               console.log(`   [BUILD] ${repo}: ${cmd}`);
               const proc = Bun.spawn(['sh', '-c', cmd], {
@@ -968,6 +1019,9 @@ export class E2EOrchestrator {
         const serviceStream = this.openServiceStream(name, port);
         const dec = new TextDecoder();
 
+        // --- ADD THIS HERE ---
+        this.writePhysicalEnvFile(worktreeDir, mergedEnv);
+
         console.log(`   [START] ${name}: ${svc.command!}`);
         const proc = Bun.spawn(['sh', '-c', svc.command!], {
           cwd: worktreeDir,
@@ -975,6 +1029,10 @@ export class E2EOrchestrator {
           stdout: 'pipe',
           stderr: 'pipe',
         });
+
+        // 1. Create an abort controller for this process's streams
+        const ac = new AbortController();
+        this.streamControllers.push(ac);
 
         proc.stdout?.pipeTo(
           new WritableStream({
@@ -986,7 +1044,8 @@ export class E2EOrchestrator {
               if (verboseMode === true) process.stdout.write(`[${name}] ${text}`);
             },
           }),
-        );
+          { signal: ac.signal }
+        ).catch(() => {});
 
         proc.stderr?.pipeTo(
           new WritableStream({
@@ -999,9 +1058,11 @@ export class E2EOrchestrator {
                 process.stderr.write(`[${name} ERR] ${text}`);
             },
           }),
-        );
+          { signal: ac.signal }
+        ).catch(() => {});
 
         this.activeProcesses.push(proc);
+proc.unref();
 
         if (hcUrl) {
           const hcPromise = this.pollHealthCheck(name, hcUrl);
@@ -1037,6 +1098,11 @@ export class E2EOrchestrator {
   }
 
   async teardown() {
+    this._seq?.stop();
+
+    // Sever all active log streams so the Bun event loop can close
+    this.streamControllers.forEach(ac => ac.abort());
+
     const forceTeardown = process.env.E2E_TEARDOWN === '1';
     if (!orchestratorCfg.global.cleanOnTeardown && !forceTeardown) {
       console.log('\n⚡ Services left running. Next bun test will warm-start in ~5s.');
@@ -1122,5 +1188,186 @@ export class E2EOrchestrator {
         throw new Error('Docker daemon is not running. Auto-start only supported on macOS.');
       }
     }
+  }
+
+  private flushDatabases(): Set<string> {
+    const targetsToRedo = new Set<string>();
+    const mongoDbsToDrop = new Set<string>();
+
+    for (const [name, svc] of Object.entries(composeServices)) {
+      const repo = svc['x-repo'];
+      if (!repo) continue;
+      const repoCfg = orchestratorCfg.repos[repo];
+      const { dbName, mongoName } = this.deduceIsolatedNames(repo, repoCfg,svc);
+
+      const flushCfg = {
+        mongo: repoCfg?.flushData?.mongo ?? orchestratorCfg.global.flushData?.mongo ?? false,
+        postgres: repoCfg?.flushData?.postgres ?? orchestratorCfg.global.flushData?.postgres ?? false,
+      };
+
+      if (flushCfg.mongo && mongoName) mongoDbsToDrop.add(mongoName);
+      if (flushCfg.postgres && dbName) targetsToRedo.add(dbName);
+    }
+
+    if (mongoDbsToDrop.size > 0 || targetsToRedo.size > 0) {
+      console.log('\n🧹 Checking for requested database wipes...');
+    }
+
+    if (mongoDbsToDrop.size > 0) {
+      try {
+        const mongoContainers = execSync(`docker ps -q -f "name=mongo"`).toString().trim().split('\n').filter(Boolean);
+        if (mongoContainers.length > 0) {
+          for (const mongoName of mongoDbsToDrop) {
+            console.log(`   -> Dropping Mongo DB: ${mongoName}`);
+            let success = false;
+            let lastErr = '';
+
+            // Loop through containers until we find the Replica Set Primary
+            for (const cid of mongoContainers) {
+              try {
+                const cmd = `CMD="mongosh"; which mongosh >/dev/null 2>&1 || CMD="mongo"; $CMD -u root -p root --authenticationDatabase admin ${mongoName} --quiet --eval "db.dropDatabase()" || $CMD ${mongoName} --quiet --eval "db.dropDatabase()"`;
+                
+                // Use input pipe to execute safely
+                execSync(`docker exec -i ${cid} sh`, { input: cmd, stdio: ['pipe', 'pipe', 'pipe'] });
+                
+                success = true;
+                targetsToRedo.add(mongoName); 
+                break; // Primary found and dropped, move to next database!
+              } catch (e: any) {
+                const errText = e.stderr ? e.stderr.toString() : '';
+                
+                // --- UPDATE THIS LINE ---
+                if (errText.includes('not primary') || errText.includes('ECONNREFUSED')) {
+                  continue; // This is a secondary node or an arbiter, try the next container
+                }
+                
+                lastErr = errText;
+              }
+            }
+
+            if (!success) {
+              console.warn(`   ⚠️  Failed to drop Mongo DB: ${mongoName}`);
+              if (lastErr) console.warn(`      Error: ${lastErr.trim()}`);
+              else console.warn(`      Error: Could not find a primary node.`);
+            }
+          }
+        } else {
+          console.warn('   ⚠️  Could not find any Mongo containers.');
+        }
+      } catch (e: any) {
+        console.warn('   ⚠️  Failed to query Mongo containers.');
+      }
+    }
+
+    return targetsToRedo;
+  }
+
+  private flushRedis() {
+    const toFlushRedis = new Set<string>();
+    for (const [name, svc] of Object.entries(composeServices)) {
+      const repo = svc['x-repo'];
+      if (!repo) continue;
+      const repoCfg = orchestratorCfg.repos[repo];
+      const { redisPrefix } = this.deduceIsolatedNames(repo, repoCfg,svc);
+
+      const flush = repoCfg?.flushData?.redis ?? orchestratorCfg.global.flushData?.redis ?? false;
+      if (flush && redisPrefix) toFlushRedis.add(redisPrefix);
+    }
+
+    if (toFlushRedis.size > 0) {
+      console.log('\n🧹 Flushing Redis namespaces...');
+      try {
+        const containerId = execSync(`docker ps -q -f "name=redis" | head -n 1`).toString().trim();
+        if (containerId) {
+          for (const prefix of toFlushRedis) {
+            console.log(`   -> Scanning Redis cluster for prefix: ${prefix}:*`);
+            
+            // Clean multi-line bash script that tallies and prints every key found
+            const script = `
+              cli=$(which valkey-cli >/dev/null 2>&1 && echo valkey-cli || echo redis-cli)
+              total=0
+              for master in $($cli -p 6000 cluster nodes 2>/dev/null | grep master | awk '{print $2}' | cut -d@ -f1); do
+                host=$(echo $master | cut -d: -f1)
+                port=$(echo $master | cut -d: -f2)
+                keys=$($cli -h $host -p $port --scan --pattern "${prefix}:*" 2>/dev/null)
+                
+                if [ -n "$keys" ]; then
+                  for key in $keys; do
+                    echo "      🗑️  Found: $key"
+                    total=$((total + 1))
+                  done
+                  # Delete the keys
+                  echo "$keys" | xargs $cli -h $host -p $port DEL >/dev/null 2>&1
+                fi
+              done
+              
+              if [ "$total" -gt 0 ]; then
+                echo "   ✅ Successfully deleted $total keys for prefix ${prefix}:*"
+              else
+                echo "   ℹ️  No existing keys found for prefix ${prefix}:*"
+              fi
+            `;
+            
+            try {
+              // Capture the stdout buffer and print it so you see the exact keys and the total!
+              const output = execSync(`docker exec -i ${containerId} sh`, { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
+              console.log(output.toString().replace(/\n$/, ''));
+            } catch (e: any) {
+              console.warn(`   ⚠️  Failed to clear Redis prefix ${prefix}:*`);
+              if (e.stderr) console.warn(`      Error: ${e.stderr.toString().trim()}`);
+            }
+          }
+        }
+      } catch (e: any) { 
+        console.warn('   ⚠️  Failed to execute Redis flush.'); 
+        if (e.stderr) console.warn(`      Error: ${e.stderr.toString().trim()}`);
+      }
+    }
+  }
+
+  private printEnvironmentSummary() {
+    console.log('\n🌍 Service Environment Topologies:');
+    const summary = [];
+    
+    for (const [name, svc] of Object.entries(composeServices)) {
+      const repo = svc['x-repo'];
+      if (!repo) continue;
+      
+      const repoCfg = orchestratorCfg.repos[repo];
+      const { dbName, mongoName, redisPrefix } = this.deduceIsolatedNames(repo, repoCfg, svc);
+      const port = hostPort(svc.ports);
+      
+      summary.push({
+        Service: name,
+        'Repo Variant': repo,
+        Target: repoCfg?.target || '-',   // <-- ADD THIS LINE
+        Port: port || '-',
+        Postgres: dbName,
+        Mongo: mongoName,
+        'Redis Prefix': redisPrefix,
+      });
+    }
+    console.table(summary);
+  }
+
+  /**
+   * Writes the compiled environment object to a physical .env file in the worktree.
+   * This guarantees tools like dotenv find the exact same variables we injected natively.
+   */
+  private writePhysicalEnvFile(worktreeDir: string, envObj: Record<string, string>) {
+    const content = Object.entries(envObj)
+      // Filter out huge raw OS variables we don't need to write to disk
+      .filter(([k]) => !k.startsWith('npm_') && k !== 'PATH' && k !== 'LS_COLORS')
+      .map(([k, v]) => {
+        const strVal = String(v);
+        // Only wrap in quotes if the value contains a space or a newline
+        if (strVal.includes(' ') || strVal.includes('\n')) {
+          return `${k}="${strVal.replace(/"/g, '\\"')}"`;
+        }
+        return `${k}=${strVal}`; // Write naked strings (Bash friendly!)
+      })
+      .join('\n');
+      
+    fs.writeFileSync(path.join(worktreeDir, '.env'), content);
   }
 }

@@ -1,7 +1,11 @@
+import fs from 'fs';
+import path from 'path';
+import { parse as parseYaml } from 'yaml';
+
 import { afterAll, beforeAll, describe } from 'bun:test';
-import { E2EOrchestrator } from '../src/E2EOrchestrator';
+import { E2EOrchestrator } from '../E2EOrchestrator';
 import { api, log } from './utils/api';
-import { BILLING, GAME, SVC_SIG } from './utils/config';
+import { BILLING_URL, GAME_URL, SERVICE_SIGNATURE, TARGET_GAME_CODE } from './utils/config';
 
 // Unit-test style specs (individual endpoint coverage)
 import { runExpTests } from './specs/exp.spec';
@@ -28,8 +32,9 @@ beforeAll(async () => {
   for (let i = 0; i < 120; i++) {
     try {
       const [bRes, gRes] = await Promise.all([
-        api.get(`${BILLING}/v2/service/games`, { headers: SVC_SIG }),
-        api.get(`${GAME}/v2/service/games`, { headers: SVC_SIG }),
+        api.get(`${BILLING_URL}/v2/service/games`, { headers: SERVICE_SIGNATURE }),
+        api.get(`${GAME_URL}/v2/service/games`, { headers: SERVICE_SIGNATURE }),
+        api.propagateConfig(), // Ensure config is propagated from billing to game
       ]);
 
       const bGames = bRes.data?.data?.games ?? bRes.data?.data ?? [];
@@ -54,6 +59,11 @@ beforeAll(async () => {
     throw new Error(
       'Timeout: Services online but process caches are empty. Check DB connectivity.',
     );
+
+  // --- ADD THIS HERE ---
+log(`[setup] Ensuring ${TARGET_GAME_CODE} is in a clean, enabled state...`);
+await api.resetGameState(TARGET_GAME_CODE);
+
   log('✅ Setup complete.');
 }, 600000);
 
@@ -62,30 +72,25 @@ afterAll(async () => {
 }, 60000);
 
 // ── Suite + test control ───────────────────────────────────────────────────────
-//
-// Skip suites by slug:         E2E_SKIP_SUITES=flow-maintenance,flow-bridge bun test:raw
-// Run only specific suites:    E2E_SUITES=service-apis,flow-bet-action bun test:raw
-//
-// Skip slow tests:             E2E_FAST=1 bun test:raw
-//   Skips any test declared with itSlow() whose expected duration > E2E_SLOW_MS (default 5000).
-//   Override threshold:        E2E_SLOW_MS=10000 E2E_FAST=1 bun test:raw
-//
-// Suite slugs: service-apis, internal-apis, experience-apis,
-//              flow-bet-action, flow-lobby, flow-maintenance, flow-bridge
 
-const _skip = new Set(
-  (process.env.E2E_SKIP_SUITES ?? '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
-);
-const _only = new Set(
-  (process.env.E2E_SUITES ?? '')
-    .split(',')
-    .map((s) => s.trim())
-    .filter(Boolean),
-);
-// (slow-test gating: see tests/utils/test-helpers.ts → itSlow)
+// 1. Read default skips from the Orchestrator YAML
+const orchCfg = parseYaml(fs.readFileSync(path.resolve('./src/e2e-orchestrator.yml'), 'utf-8'));
+const yamlSkips: string[] = orchCfg?.global?.skipSuites ?? [];
+
+// 2. Read CLI environment variables (allows developers to override via CLI)
+const envSkips = (process.env.E2E_SKIP_SUITES ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+const envOnly = (process.env.E2E_SUITES ?? '')
+  .split(',')
+  .map((s) => s.trim())
+  .filter(Boolean);
+
+// 3. Merge them into sets
+const _skip = new Set([...yamlSkips, ...envSkips]);
+const _only = new Set(envOnly);
 
 function suite(slug: string, label: string, fn: () => void) {
   const active = (_only.size === 0 || _only.has(slug)) && !_skip.has(slug);

@@ -19,7 +19,7 @@ export function runLobbyFlowTests() {
   let lobbyRefreshToken = '';
 
   it('Step 1: Session Start', async () => {
-    const res = await gameClient.startSession({ rtpCode: 'RTP_97' });
+    const res = await gameClient.startSession();
 
     if (res.status !== 200) logError('[lobby/step1] Session start failed:', res.data);
     expect(res.status).toBe(200);

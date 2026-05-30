@@ -17,7 +17,7 @@
  * Force full restart: bun reset
  */
 
-import { E2EOrchestrator } from '../src/E2EOrchestrator';
+import { E2EOrchestrator } from '../E2EOrchestrator';
 
 const orchestrator = new E2EOrchestrator();
 

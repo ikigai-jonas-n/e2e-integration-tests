@@ -4,7 +4,7 @@
  * focused on the WHAT (assertions) not the HOW (header wiring).
  */
 import { api } from './api';
-import { BILLING, GAME, SVC_SIG } from './config';
+import { BILLING_URL, GAME_URL, SERVICE_SIGNATURE, TARGET_GAME_CODE, TARGET_RTP_CODE } from './config';
 
 // ─── Shared player constants ──────────────────────────────────────────────────
 
@@ -25,28 +25,28 @@ export const billingClient = {
    */
   async getAmToken(permissions: string[] = ['*']) {
     return api.post(
-      `${BILLING}/v1/service/am/token`,
+      `${BILLING_URL}/v1/service/am/token`,
       {
         userId: 0,
         account: 'tester',
         code: 'SLT',
         permission: permissions.map((routeKey) => ({ routeKey, methods: ['*'] })),
       },
-      { headers: SVC_SIG },
+      { headers: SERVICE_SIGNATURE },
     );
   },
 
   async getGames() {
-    return api.get(`${BILLING}/v2/service/games`, { headers: SVC_SIG });
+    return api.get(`${BILLING_URL}/v2/service/games`, { headers: SERVICE_SIGNATURE });
   },
 
   async getSyncGames() {
-    return api.get(`${BILLING}/v2/service/sync-games`, { headers: SVC_SIG });
+    return api.get(`${BILLING_URL}/v2/service/sync-games`, { headers: SERVICE_SIGNATURE });
   },
 
   async setGamesStatus(amToken: string, updates: { code: string; enabled: boolean }[]) {
     return api.patch(
-      `${BILLING}/v1/internal/games/status`,
+      `${BILLING_URL}/v1/internal/games/status`,
       { data: updates },
       { headers: { 'x-access-token': amToken } },
     );
@@ -54,7 +54,7 @@ export const billingClient = {
 
   async setBetLevels(amToken: string, gameCode: string, currencyCode: string, betLevels: any[]) {
     return api.patch(
-      `${BILLING}/v1/internal/game/${gameCode}/betLevels`,
+      `${BILLING_URL}/v1/internal/game/${gameCode}/betLevels`,
       { currencyCode, betLevels },
       { headers: { 'x-access-token': amToken } },
     );
@@ -62,7 +62,7 @@ export const billingClient = {
 
   async setMaintenance(amToken: string, gameCode: string, isMaintenance: boolean) {
     return api.patch(
-      `${BILLING}/v1/internal/game/${gameCode}/maintenance`,
+      `${BILLING_URL}/v1/internal/game/${gameCode}/maintenance`,
       { isMaintenance },
       { headers: { 'x-access-token': amToken } },
     );
@@ -73,10 +73,11 @@ export const billingClient = {
 
 export const gameClient = {
   async getGames() {
-    return api.get(`${GAME}/v2/service/games`, { headers: SVC_SIG });
+    return api.get(`${GAME_URL}/v2/service/games`, { headers: SERVICE_SIGNATURE });
   },
 
   async startSession(
+    // 1. Keep the type definition clean (no equals signs here)
     opts: {
       gameCode?: string;
       playerId?: string;
@@ -88,23 +89,29 @@ export const gameClient = {
       currency?: string;
     } = {},
   ) {
+    // 2. Assign the default values during object destructuring
     const {
-      gameCode = 'LGS-004',
+      gameCode = TARGET_GAME_CODE,     // <-- DEFAULT ASSIGNED HERE
       playerId = KYLE.playerId,
       externalPlayerId = KYLE.externalPlayerId,
       operator = KYLE.operator,
       brand = KYLE.brand,
-      rtpCode = 'RTP_97',
+      rtpCode = TARGET_RTP_CODE,       // <-- DEFAULT ASSIGNED HERE
       country = 'GB',
       currency = 'EUR',
     } = opts;
+
     return api.post(
-      `${GAME}/v2/service/session/start`,
+      `${GAME_URL}/v2/service/session/start`,
       {
-        gameCode,
+        gameCode,                      // <-- Uses the destructured variable
         lang: 'en',
         country,
-        gameSetting: { rtpConfigCode: rtpCode, isGeoBlocking: true, jurisdictionCode: 'slotJD' },
+        gameSetting: { 
+          rtpConfigCode: rtpCode,      // <-- Uses the destructured variable
+          isGeoBlocking: true, 
+          jurisdictionCode: 'slotJD' 
+        },
         mode: 'real',
         operator,
         brand,
@@ -118,12 +125,12 @@ export const gameClient = {
         licenseConfig: {},
         callback: 'http://localhost',
       },
-      { headers: SVC_SIG },
+      { headers: SERVICE_SIGNATURE },
     );
   },
 
   async activateSession(token: string) {
-    return api.post(`${GAME}/v2/exp/session/activate`, {
+    return api.post(`${GAME_URL}/v2/exp/session/activate`, {
       token,
       ts: Date.now(),
       timezone: 'Asia/Taipei',
@@ -140,7 +147,7 @@ export const gameClient = {
   /** Places a bet. Returns the full response including roundId and actions. */
   async bet(sessionId: string, accessToken: string, betValue = '2') {
     return api.post(
-      `${GAME}/v2/exp/play/bet`,
+      `${GAME_URL}/v2/exp/play/bet`,
       {
         session: sessionId,
         bet: { type: 'regular', value: betValue },
@@ -160,7 +167,7 @@ export const gameClient = {
 
   async action(sessionId: string, accessToken: string, roundId: string, actionData: any) {
     return api.post(
-      `${GAME}/v2/exp/play/action`,
+      `${GAME_URL}/v2/exp/play/action`,
       {
         session: sessionId,
         roundId,
@@ -179,7 +186,7 @@ export const gameClient = {
 
   async finish(sessionId: string, accessToken: string, roundId: string) {
     return api.post(
-      `${GAME}/v2/exp/play/finish`,
+      `${GAME_URL}/v2/exp/play/finish`,
       {
         session: sessionId,
         roundId,
@@ -197,13 +204,13 @@ export const gameClient = {
 
   async activateSessionToken(gameAccessToken: string) {
     return api.post(
-      `${GAME}/v1/exp/session-token/activate`,
+      `${GAME_URL}/v1/exp/session-token/activate`,
       {},
       { headers: { authorization: `Bearer ${gameAccessToken}` } },
     );
   },
 
   async refreshSessionToken(refreshToken: string) {
-    return api.post(`${GAME}/v1/exp/session-token/refresh`, { refreshToken });
+    return api.post(`${GAME_URL}/v1/exp/session-token/refresh`, { refreshToken });
   },
 };

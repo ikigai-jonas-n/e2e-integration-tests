@@ -17,7 +17,7 @@ echo "==============================================="
 # E2E_LOG_DIR → orchestrator writes per-service logs + master log there.
 # tee captures bun:test stdout/stderr into _master.log too.
 # Change this line:
-E2E_LOG_DIR="$LOG_DIR" bun test 2>&1 | tee "$MASTER_LOG"
+E2E_LOG_DIR="$LOG_DIR" bun test src/tests 2>&1 | tee "$MASTER_LOG"
 TEST_EXIT_CODE=${PIPESTATUS[0]}
 
 # ── Split master log into per-suite test logs ─────────────────────────────────

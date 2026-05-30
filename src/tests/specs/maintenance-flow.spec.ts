@@ -11,23 +11,23 @@
  */
 import { expect, it } from 'bun:test';
 import { api, logError } from '../utils/api';
-import { BILLING, SVC_SIG } from '../utils/config';
+import { BILLING_URL, SERVICE_SIGNATURE, TARGET_GAME_CODE } from '../utils/config';
 import { atLeast } from '../utils/version-gate';
 
 export function runMaintenanceFlowTests() {
   let amToken = '';
-  const GAME_CODE = 'LGS-004';
+  const GAME_CODE = TARGET_GAME_CODE;
 
   it('Step 1: Get AM Token with maintenance permission', async () => {
     const res = await api.post(
-      `${BILLING}/v1/service/am/token`,
+      `${BILLING_URL}/v1/service/am/token`,
       {
         userId: 0,
         account: 'tester',
         code: 'SLT',
         permission: [{ routeKey: 'V1_INTERNAL_GAME_MAINTENANCE', methods: ['*'] }],
       },
-      { headers: SVC_SIG },
+      { headers: SERVICE_SIGNATURE },
     );
 
     if (res.status !== 200) logError('[maint/step1] AM token failed:', res.data);
@@ -40,7 +40,7 @@ export function runMaintenanceFlowTests() {
   // @requires billing >= 1.8.0  (patchMaintenance endpoint)
   it.if(atLeast('billing', '1.8.0'))('Step 2: Set isMaintenance = true', async () => {
     const res = await api.patch(
-      `${BILLING}/v1/internal/game/${GAME_CODE}/maintenance`,
+      `${BILLING_URL}/v1/internal/game/${GAME_CODE}/maintenance`,
       { isMaintenance: true },
       { headers: { 'x-access-token': amToken } },
     );
@@ -51,7 +51,7 @@ export function runMaintenanceFlowTests() {
 
   // @requires billing >= 1.8.0
   it.if(atLeast('billing', '1.8.0'))('Step 3: Billing confirms isMaintenance = true', async () => {
-    const res = await api.get(`${BILLING}/v2/service/sync-games`, { headers: SVC_SIG });
+    const res = await api.get(`${BILLING_URL}/v2/service/sync-games`, { headers: SERVICE_SIGNATURE });
     expect(res.status).toBe(200);
 
     const games = res.data?.data?.games ?? res.data?.data;
@@ -64,7 +64,7 @@ export function runMaintenanceFlowTests() {
   // @requires billing >= 1.8.0
   it.if(atLeast('billing', '1.8.0'))('Step 4: Restore isMaintenance = false', async () => {
     const res = await api.patch(
-      `${BILLING}/v1/internal/game/${GAME_CODE}/maintenance`,
+      `${BILLING_URL}/v1/internal/game/${GAME_CODE}/maintenance`,
       { isMaintenance: false },
       { headers: { 'x-access-token': amToken } },
     );
@@ -75,7 +75,7 @@ export function runMaintenanceFlowTests() {
 
   // @requires billing >= 1.8.0
   it.if(atLeast('billing', '1.8.0'))('Step 5: Billing confirms isMaintenance = false', async () => {
-    const res = await api.get(`${BILLING}/v2/service/sync-games`, { headers: SVC_SIG });
+    const res = await api.get(`${BILLING_URL}/v2/service/sync-games`, { headers: SERVICE_SIGNATURE });
     expect(res.status).toBe(200);
 
     const games = res.data?.data?.games ?? res.data?.data;
