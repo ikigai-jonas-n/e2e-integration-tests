@@ -9,22 +9,26 @@
  * Steps 2-5 require billing >= 1.8.0 (patchMaintenance added to registerCoreServiceEndpoints).
  * On older billing versions they are automatically skipped — no need to comment them out.
  */
-import { it, expect } from 'bun:test';
+import { expect, it } from 'bun:test';
 import { api, logError } from '../utils/api';
-import { atLeast } from '../utils/version-gate';
 import { BILLING, SVC_SIG } from '../utils/config';
+import { atLeast } from '../utils/version-gate';
 
 export function runMaintenanceFlowTests() {
   let amToken = '';
   const GAME_CODE = 'LGS-004';
 
   it('Step 1: Get AM Token with maintenance permission', async () => {
-    const res = await api.post(`${BILLING}/v1/service/am/token`, {
-      userId: 0,
-      account: 'tester',
-      code: 'SLT',
-      permission: [{ routeKey: 'V1_INTERNAL_GAME_MAINTENANCE', methods: ['*'] }],
-    }, { headers: SVC_SIG });
+    const res = await api.post(
+      `${BILLING}/v1/service/am/token`,
+      {
+        userId: 0,
+        account: 'tester',
+        code: 'SLT',
+        permission: [{ routeKey: 'V1_INTERNAL_GAME_MAINTENANCE', methods: ['*'] }],
+      },
+      { headers: SVC_SIG },
+    );
 
     if (res.status !== 200) logError('[maint/step1] AM token failed:', res.data);
     expect(res.status).toBe(200);
@@ -51,7 +55,7 @@ export function runMaintenanceFlowTests() {
     expect(res.status).toBe(200);
 
     const games = res.data?.data?.games ?? res.data?.data;
-    const game  = games?.find((g: any) => g.code === GAME_CODE);
+    const game = games?.find((g: any) => g.code === GAME_CODE);
 
     expect(game).toBeDefined();
     expect(game?.isMaintenance).toBe(true);
@@ -75,7 +79,7 @@ export function runMaintenanceFlowTests() {
     expect(res.status).toBe(200);
 
     const games = res.data?.data?.games ?? res.data?.data;
-    const game  = games?.find((g: any) => g.code === GAME_CODE);
+    const game = games?.find((g: any) => g.code === GAME_CODE);
 
     expect(game).toBeDefined();
     expect(game?.isMaintenance).toBe(false);

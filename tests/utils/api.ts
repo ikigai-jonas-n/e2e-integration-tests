@@ -80,13 +80,17 @@ export const api = {
     // 2. Re-PATCH all games → publishes GAME_DATA Kafka event
     //    → Bridge receives → updates Redis with fresh state
     if (Array.isArray(games)) {
-      await api.patch(`${BILLING}/v1/internal/games/status`, {
-        data: games.map((g: any) => ({ code: g.code, enabled: g.enabled }))
-      }, { headers: { 'x-access-token': amToken } });
+      await api.patch(
+        `${BILLING}/v1/internal/games/status`,
+        {
+          data: games.map((g: any) => ({ code: g.code, enabled: g.enabled })),
+        },
+        { headers: { 'x-access-token': amToken } },
+      );
     }
 
     // 3. Wait for Bridge to process the Kafka event and write updated game states to Redis
-    await new Promise(r => setTimeout(r, 2500));
+    await new Promise((r) => setTimeout(r, 2500));
 
     // 4. Evict the game codes registry key from Redis.
     //    Key: {no_version}:gameCodes  (VERSION env var is unset → defaults to 'no_version')
@@ -110,17 +114,25 @@ export const api = {
 
   resetGameState: async (gameCode: string, amToken: string) => {
     // Force Enablement
-    await api.patch(`${BILLING}/v1/internal/games/status`, {
-      data: [{ code: gameCode, enabled: true }]
-    }, { headers: { 'x-access-token': amToken } });
+    await api.patch(
+      `${BILLING}/v1/internal/games/status`,
+      {
+        data: [{ code: gameCode, enabled: true }],
+      },
+      { headers: { 'x-access-token': amToken } },
+    );
 
     // Force Standard Bet Levels (EUR 2)
-    await api.patch(`${BILLING}/v1/internal/game/${gameCode}/betLevels`, {
-      currencyCode: 'EUR',
-      betLevels: [{ type: 'regular', value: '2', default: true }],
-    }, { headers: { 'x-access-token': amToken } });
+    await api.patch(
+      `${BILLING}/v1/internal/game/${gameCode}/betLevels`,
+      {
+        currencyCode: 'EUR',
+        betLevels: [{ type: 'regular', value: '2', default: true }],
+      },
+      { headers: { 'x-access-token': amToken } },
+    );
 
     // Synchronize nodes instantly
     await api.propagateConfig(amToken);
-  }
+  },
 };

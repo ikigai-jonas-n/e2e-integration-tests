@@ -2,8 +2,8 @@
  * Spin up the full E2E environment without running any tests.
  *
  * Usage:
- *   bun dev                   # start services and keep running
- *   E2E_TEARDOWN=1 bun dev    # teardown then exit
+ *   bun setup:env                   # start services and keep running
+ *   E2E_TEARDOWN=1 bun setup:env    # teardown then exit
  *
  * What it does:
  *   1. Provisions git worktrees
@@ -42,7 +42,10 @@ async function main() {
 
     // Keep process alive so logs stream and Ctrl+C is clean
     await new Promise<void>((resolve) => {
-      process.on('SIGINT',  () => { console.log('\nExiting (services still running)…'); resolve(); });
+      process.on('SIGINT', () => {
+        console.log('\nExiting (services still running)…');
+        resolve();
+      });
       process.on('SIGTERM', () => resolve());
     });
   } catch (err) {

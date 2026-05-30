@@ -10,10 +10,10 @@ import { BILLING, GAME, SVC_SIG } from './config';
 
 /** Only this player is registered in the external money/player services. */
 export const KYLE = {
-  playerId:         'QARealGameOperator:QARealGameBrand:kyle0c',
+  playerId: 'QARealGameOperator:QARealGameBrand:kyle0c',
   externalPlayerId: 'kyle0c',
-  operator:         'QARealGameOperator',
-  brand:            'QARealGameBrand',
+  operator: 'QARealGameOperator',
+  brand: 'QARealGameBrand',
 } as const;
 
 // ─── Billing client ───────────────────────────────────────────────────────────
@@ -24,12 +24,16 @@ export const billingClient = {
    * All internal/admin endpoints require `x-access-token: <amToken>`.
    */
   async getAmToken(permissions: string[] = ['*']) {
-    return api.post(`${BILLING}/v1/service/am/token`, {
-      userId: 0,
-      account: 'tester',
-      code: 'SLT',
-      permission: permissions.map(routeKey => ({ routeKey, methods: ['*'] })),
-    }, { headers: SVC_SIG });
+    return api.post(
+      `${BILLING}/v1/service/am/token`,
+      {
+        userId: 0,
+        account: 'tester',
+        code: 'SLT',
+        permission: permissions.map((routeKey) => ({ routeKey, methods: ['*'] })),
+      },
+      { headers: SVC_SIG },
+    );
   },
 
   async getGames() {
@@ -41,20 +45,27 @@ export const billingClient = {
   },
 
   async setGamesStatus(amToken: string, updates: { code: string; enabled: boolean }[]) {
-    return api.patch(`${BILLING}/v1/internal/games/status`, { data: updates },
-      { headers: { 'x-access-token': amToken } });
+    return api.patch(
+      `${BILLING}/v1/internal/games/status`,
+      { data: updates },
+      { headers: { 'x-access-token': amToken } },
+    );
   },
 
   async setBetLevels(amToken: string, gameCode: string, currencyCode: string, betLevels: any[]) {
-    return api.patch(`${BILLING}/v1/internal/game/${gameCode}/betLevels`,
+    return api.patch(
+      `${BILLING}/v1/internal/game/${gameCode}/betLevels`,
       { currencyCode, betLevels },
-      { headers: { 'x-access-token': amToken } });
+      { headers: { 'x-access-token': amToken } },
+    );
   },
 
   async setMaintenance(amToken: string, gameCode: string, isMaintenance: boolean) {
-    return api.patch(`${BILLING}/v1/internal/game/${gameCode}/maintenance`,
+    return api.patch(
+      `${BILLING}/v1/internal/game/${gameCode}/maintenance`,
       { isMaintenance },
-      { headers: { 'x-access-token': amToken } });
+      { headers: { 'x-access-token': amToken } },
+    );
   },
 };
 
@@ -65,36 +76,50 @@ export const gameClient = {
     return api.get(`${GAME}/v2/service/games`, { headers: SVC_SIG });
   },
 
-  async startSession(opts: {
-    gameCode?: string;
-    playerId?: string;
-    externalPlayerId?: string;
-    operator?: string;
-    brand?: string;
-    rtpCode?: string;
-    country?: string;
-    currency?: string;
-  } = {}) {
+  async startSession(
+    opts: {
+      gameCode?: string;
+      playerId?: string;
+      externalPlayerId?: string;
+      operator?: string;
+      brand?: string;
+      rtpCode?: string;
+      country?: string;
+      currency?: string;
+    } = {},
+  ) {
     const {
-      gameCode         = 'LGS-004',
-      playerId         = KYLE.playerId,
+      gameCode = 'LGS-004',
+      playerId = KYLE.playerId,
       externalPlayerId = KYLE.externalPlayerId,
-      operator         = KYLE.operator,
-      brand            = KYLE.brand,
-      rtpCode          = 'RTP_97',
-      country          = 'GB',
-      currency         = 'EUR',
+      operator = KYLE.operator,
+      brand = KYLE.brand,
+      rtpCode = 'RTP_97',
+      country = 'GB',
+      currency = 'EUR',
     } = opts;
-    return api.post(`${GAME}/v2/service/session/start`, {
-      gameCode, lang: 'en', country,
-      gameSetting: { rtpConfigCode: rtpCode, isGeoBlocking: true, jurisdictionCode: 'slotJD' },
-      mode: 'real', operator, brand,
-      playerId, externalPlayerId,
-      currency, currencyId: 1,
-      balance: '10000', maxExposure: 0,
-      isTestingPlayer: false, licenseConfig: {},
-      callback: 'http://localhost',
-    }, { headers: SVC_SIG });
+    return api.post(
+      `${GAME}/v2/service/session/start`,
+      {
+        gameCode,
+        lang: 'en',
+        country,
+        gameSetting: { rtpConfigCode: rtpCode, isGeoBlocking: true, jurisdictionCode: 'slotJD' },
+        mode: 'real',
+        operator,
+        brand,
+        playerId,
+        externalPlayerId,
+        currency,
+        currencyId: 1,
+        balance: '10000',
+        maxExposure: 0,
+        isTestingPlayer: false,
+        licenseConfig: {},
+        callback: 'http://localhost',
+      },
+      { headers: SVC_SIG },
+    );
   },
 
   async activateSession(token: string) {
@@ -103,59 +128,79 @@ export const gameClient = {
       ts: Date.now(),
       timezone: 'Asia/Taipei',
       analytics: {
-        language: 'en', device: 'mobile',
+        language: 'en',
+        device: 'mobile',
         resolution: { w: 0, h: 0 },
-        orientation: 'landscape', connection: 'wifi',
+        orientation: 'landscape',
+        connection: 'wifi',
       },
     });
   },
 
   /** Places a bet. Returns the full response including roundId and actions. */
   async bet(sessionId: string, accessToken: string, betValue = '2') {
-    return api.post(`${GAME}/v2/exp/play/bet`, {
-      session: sessionId,
-      bet: { type: 'regular', value: betValue },
-      stakeMode: { type: 'commonGame', multiplier: 1, name: 'regular bet', rtp: 96.56 },
-      ts: Date.now(),
-    }, {
-      headers: {
-        authorization: `Bearer ${accessToken}`,
-        'x-access-token': accessToken,
-        'cloudfront-viewer-country': 'JP',
-        'cloudfront-viewer-address': '1.2.3.4',
+    return api.post(
+      `${GAME}/v2/exp/play/bet`,
+      {
+        session: sessionId,
+        bet: { type: 'regular', value: betValue },
+        stakeMode: { type: 'commonGame', multiplier: 1, name: 'regular bet', rtp: 96.56 },
+        ts: Date.now(),
       },
-    });
+      {
+        headers: {
+          authorization: `Bearer ${accessToken}`,
+          'x-access-token': accessToken,
+          'cloudfront-viewer-country': 'JP',
+          'cloudfront-viewer-address': '1.2.3.4',
+        },
+      },
+    );
   },
 
   async action(sessionId: string, accessToken: string, roundId: string, actionData: any) {
-    return api.post(`${GAME}/v2/exp/play/action`, {
-      session: sessionId, roundId, ...actionData,
-    }, {
-      headers: {
-        authorization: `Bearer ${accessToken}`,
-        'x-access-token': accessToken,
-        'cloudfront-viewer-country': 'JP',
-        'cloudfront-viewer-address': '1.2.3.4',
+    return api.post(
+      `${GAME}/v2/exp/play/action`,
+      {
+        session: sessionId,
+        roundId,
+        ...actionData,
       },
-    });
+      {
+        headers: {
+          authorization: `Bearer ${accessToken}`,
+          'x-access-token': accessToken,
+          'cloudfront-viewer-country': 'JP',
+          'cloudfront-viewer-address': '1.2.3.4',
+        },
+      },
+    );
   },
 
   async finish(sessionId: string, accessToken: string, roundId: string) {
-    return api.post(`${GAME}/v2/exp/play/finish`, {
-      session: sessionId, roundId,
-    }, {
-      headers: {
-        authorization: `Bearer ${accessToken}`,
-        'x-access-token': accessToken,
-        'cloudfront-viewer-country': 'JP',
-        'cloudfront-viewer-address': '1.2.3.4',
+    return api.post(
+      `${GAME}/v2/exp/play/finish`,
+      {
+        session: sessionId,
+        roundId,
       },
-    });
+      {
+        headers: {
+          authorization: `Bearer ${accessToken}`,
+          'x-access-token': accessToken,
+          'cloudfront-viewer-country': 'JP',
+          'cloudfront-viewer-address': '1.2.3.4',
+        },
+      },
+    );
   },
 
   async activateSessionToken(gameAccessToken: string) {
-    return api.post(`${GAME}/v1/exp/session-token/activate`, {},
-      { headers: { authorization: `Bearer ${gameAccessToken}` } });
+    return api.post(
+      `${GAME}/v1/exp/session-token/activate`,
+      {},
+      { headers: { authorization: `Bearer ${gameAccessToken}` } },
+    );
   },
 
   async refreshSessionToken(refreshToken: string) {

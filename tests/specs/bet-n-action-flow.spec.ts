@@ -6,15 +6,15 @@
  *   4. Action           → only if bet response contains data.actions[0]
  *   5. Finish           → only if data.results.gameResponse.step.summary.coins > 0
  */
-import { it, expect } from 'bun:test';
+import { expect, it } from 'bun:test';
 import { logError, logWarn } from '../utils/api';
 import { gameClient } from '../utils/client';
 
 export function runBetAndActionFlow() {
   let sessionToken = '';
-  let accessToken  = '';
-  let sessionId    = '';
-  let roundId      = '';
+  let accessToken = '';
+  let sessionId = '';
+  let roundId = '';
   let betData: any = null;
 
   it('Step 1: Session Start', async () => {
@@ -26,7 +26,7 @@ export function runBetAndActionFlow() {
     // Token lives in launchUrl as ?token=... (same pattern as bet-flow.sh)
     const launchUrl = res.data?.data?.launchUrl ?? '';
     sessionToken = launchUrl.match(/[?&]token=([^&]+)/)?.[1] ?? res.data?.data?.token ?? '';
-    sessionId    = res.data?.data?.session ?? res.data?.data?.sessionId ?? '';
+    sessionId = res.data?.data?.session ?? res.data?.data?.sessionId ?? '';
     expect(sessionToken).toBeTruthy();
     expect(sessionId).toBeTruthy();
   });
@@ -58,7 +58,10 @@ export function runBetAndActionFlow() {
     if (!Array.isArray(actions) || actions.length === 0) return;
 
     const action = actions[0]?.action ?? actions[0];
-    const res    = await gameClient.action(sessionId, accessToken, roundId, { action, ts: Date.now() });
+    const res = await gameClient.action(sessionId, accessToken, roundId, {
+      action,
+      ts: Date.now(),
+    });
 
     if (res.status !== 200) logError('[bet-flow/step4] Action failed:', res.data);
     expect(res.status).toBe(200);

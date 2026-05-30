@@ -1,4 +1,4 @@
-import { it, expect } from 'bun:test';
+import { expect, it } from 'bun:test';
 import { api } from '../utils/api';
 import { BILLING, GAME, SVC_SIG } from '../utils/config';
 

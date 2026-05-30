@@ -7,15 +7,15 @@
  *   4. Session-token refresh POST /v1/exp/session-token/refresh  { refreshToken }
  *                            → REFRESHED_ACCESS_TOKEN, REFRESHED_REFRESH_TOKEN
  */
-import { it, expect } from 'bun:test';
+import { expect, it } from 'bun:test';
 import { logError } from '../utils/api';
 import { gameClient } from '../utils/client';
 
 export function runLobbyFlowTests() {
-  let sessionToken      = '';
-  let sessionId         = '';
-  let gameAccessToken   = '';
-  let lobbyAccessToken  = '';
+  let sessionToken = '';
+  let sessionId = '';
+  let gameAccessToken = '';
+  let lobbyAccessToken = '';
   let lobbyRefreshToken = '';
 
   it('Step 1: Session Start', async () => {
@@ -26,7 +26,7 @@ export function runLobbyFlowTests() {
 
     const launchUrl = res.data?.data?.launchUrl ?? '';
     sessionToken = launchUrl.match(/[?&]token=([^&]+)/)?.[1] ?? res.data?.data?.token ?? '';
-    sessionId    = res.data?.data?.session ?? res.data?.data?.sessionId ?? '';
+    sessionId = res.data?.data?.session ?? res.data?.data?.sessionId ?? '';
     expect(sessionToken).toBeTruthy();
     expect(sessionId).toBeTruthy();
   });
@@ -48,10 +48,10 @@ export function runLobbyFlowTests() {
     if (res.status !== 200) logError('[lobby/step3] Session-token activate failed:', res.data);
     expect(res.status).toBe(200);
 
-    lobbyAccessToken  = res.data?.data?.accessToken  ?? '';
+    lobbyAccessToken = res.data?.data?.accessToken ?? '';
     lobbyRefreshToken = res.data?.data?.refreshToken ?? '';
-    const tokenType   = res.data?.data?.tokenType    ?? 'Bearer';
-    const expiresIn   = res.data?.data?.expiresIn    ?? 0;
+    const tokenType = res.data?.data?.tokenType ?? 'Bearer';
+    const expiresIn = res.data?.data?.expiresIn ?? 0;
 
     expect(lobbyAccessToken).toBeTruthy();
     expect(lobbyRefreshToken).toBeTruthy();
@@ -61,14 +61,14 @@ export function runLobbyFlowTests() {
 
   it('Step 4: Session-token Refresh → refreshed lobby tokens', async () => {
     // Simulate token expiry window (mirrors lobby-flow.sh)
-    await new Promise(r => setTimeout(r, 5000));
+    await new Promise((r) => setTimeout(r, 5000));
 
     const res = await gameClient.refreshSessionToken(lobbyRefreshToken);
 
     if (res.status !== 200) logError('[lobby/step4] Session-token refresh failed:', res.data);
     expect(res.status).toBe(200);
 
-    const refreshedAccess  = res.data?.data?.accessToken  ?? '';
+    const refreshedAccess = res.data?.data?.accessToken ?? '';
     const refreshedRefresh = res.data?.data?.refreshToken ?? '';
 
     expect(refreshedAccess).toBeTruthy();

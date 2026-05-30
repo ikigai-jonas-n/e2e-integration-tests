@@ -28,9 +28,9 @@
  *   it.if(atLeast('billing', '>=1.8.0 <2.0.0'))('…', async () => { … });
  */
 
-import fs       from 'fs';
-import path     from 'path';
 import { execFileSync } from 'child_process';
+import fs from 'fs';
+import path from 'path';
 import { parse as parseYaml } from 'yaml';
 
 // ── Load configs at module init (synchronous, happens once) ──────────────────
@@ -38,12 +38,14 @@ import { parse as parseYaml } from 'yaml';
 type RepoEntry = { repoPath: string; target: string };
 type OrchestratorConfig = {
   global: { worktreeBasePath: string };
-  repos:  Record<string, RepoEntry>;
+  repos: Record<string, RepoEntry>;
 };
 type ComposeFile = { services?: Record<string, { 'x-repo'?: string }> };
 
-const orch    = parseYaml(fs.readFileSync('./e2e-orchestrator.yml', 'utf-8')) as OrchestratorConfig;
-const composed = parseYaml(fs.readFileSync('./docker-compose.services.yml', 'utf-8')) as ComposeFile;
+const orch = parseYaml(fs.readFileSync('./e2e-orchestrator.yml', 'utf-8')) as OrchestratorConfig;
+const composed = parseYaml(
+  fs.readFileSync('./docker-compose.services.yml', 'utf-8'),
+) as ComposeFile;
 
 const worktreeBase = path.resolve(orch.global.worktreeBasePath);
 
@@ -79,7 +81,9 @@ function gitTimestamp(dir: string, ref: string): number | null {
     const raw = execFileSync('git', ['log', '-1', '--format=%ct', ref], {
       cwd: dir,
       stdio: ['pipe', 'pipe', 'pipe'],
-    }).toString().trim();
+    })
+      .toString()
+      .trim();
     const n = parseInt(raw, 10);
     return isNaN(n) ? null : n;
   } catch {
@@ -103,9 +107,9 @@ const _isBranch = (v: string) => !_isSemver(v);
 
 function _applyOp(diff: number, operator: string): boolean {
   if (operator === '>=' || operator === '') return diff >= 0;
-  if (operator === '>')                     return diff >  0;
-  if (operator === '<=')                    return diff <= 0;
-  if (operator === '<')                     return diff <  0;
+  if (operator === '>') return diff > 0;
+  if (operator === '<=') return diff <= 0;
+  if (operator === '<') return diff < 0;
   if (operator === '==' || operator === '=') return diff === 0;
   if (operator === '!=' || operator === '!') return diff !== 0;
   return diff >= 0;
@@ -117,7 +121,7 @@ function _satisfies(repoKey: string, target: string, constraint: string): boolea
   // Split compound ranges (e.g. ">=1.8.0 <2.0.0") and AND them
   const parts = constraint.trim().split(/\s+/).filter(Boolean);
   if (parts.length > 1) {
-    return parts.every(p => _satisfies(repoKey, target, p));
+    return parts.every((p) => _satisfies(repoKey, target, p));
   }
 
   const raw = constraint.trim();
@@ -139,17 +143,21 @@ function _satisfies(repoKey: string, target: string, constraint: string): boolea
 
   if (_isSemver(target)) {
     // ── Path 1: both sides are semver → use Bun.semver ────────────────────
-    const clean    = target.replace(/^v/, '');
+    const clean = target.replace(/^v/, '');
     const semRange = /^[><=!]/.test(raw) ? raw : `>=${raw}`;
-    try { return Bun.semver.satisfies(clean, semRange); }
-    catch { /* fall through to timestamp */ }
+    try {
+      return Bun.semver.satisfies(clean, semRange);
+    } catch {
+      /* fall through to timestamp */
+    }
   }
 
   // ── Path 2: branch target → use git commit timestamps ─────────────────────
   if (_isBranch(target)) {
-    const headTs     = gitTimestamp(worktreeDir, 'HEAD');
-    const requiredTs = gitTimestamp(worktreeDir, requiredVersion)
-                    ?? gitTimestamp(worktreeDir, `v${requiredVersion}`);
+    const headTs = gitTimestamp(worktreeDir, 'HEAD');
+    const requiredTs =
+      gitTimestamp(worktreeDir, requiredVersion) ??
+      gitTimestamp(worktreeDir, `v${requiredVersion}`);
 
     if (headTs !== null && requiredTs !== null) {
       return _applyOp(headTs - requiredTs, operator);
@@ -173,7 +181,7 @@ function _satisfies(repoKey: string, target: string, constraint: string): boolea
  */
 export function atLeast(serviceKey: string, constraint: string): boolean {
   const repoKey = resolveRepoKey(serviceKey);
-  const cfg     = orch.repos?.[repoKey];
+  const cfg = orch.repos?.[repoKey];
   if (!cfg) return true; // unknown service — don't skip
 
   const normalised = /^[0-9v]/.test(constraint) ? `>=${constraint}` : constraint;
