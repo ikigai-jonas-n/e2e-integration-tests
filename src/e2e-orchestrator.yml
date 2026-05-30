@@ -22,8 +22,8 @@ global:
   # Global data flushing defaults on startup
   flushData:
     redis: true      # Clears deduced Redis namespaces
-    mongo: true      # Drops deduced Mongo databases
-    postgres: false  # Runs 'migrate down all'. Default false to speed up local boots.
+    # mongo: true      # Drops deduced Mongo databases
+    # postgres: false  # Runs 'migrate down all'. Default false to speed up local boots.
 
 # Git repos to check out as worktrees before starting services.
 # target can be a branch name OR a version tag — both are supported.
@@ -46,9 +46,9 @@ repos:
   # migrationEnvFile to borrow billing's credentials (host/port/user/pass),
   # while envOverrides changes the database name to keep them isolated.
 
-  remote-game-server:
+  remote-game-server-no-db:
     repoPath: "../remote-game-server"
-    target: "1.15.1"                          # game-activity, job-stale-rounds, job-close-inactive
+    target: "main"                          # game-activity, job-stale-rounds, job-close-inactive
     migrationEnvFile: ".env.billing.example"  # first svc (game-activity) has no DB credentials
     envOverrides:
       DB_NAME: "slot_main"
@@ -61,21 +61,21 @@ repos:
 
   remote-game-server-billing:
     repoPath: "../remote-game-server"
-    target: "1.7.10"                        # billing
+    target: "main"                        # billing
     alwaysRedoMigration: false
     # uses billing env by default — has all DB credentials
     # DB_NAME=slot, MONGO_NAME=rgs (defaults from .env.billing.example)
 
   remote-game-server-bridge:
     repoPath: "../remote-game-server"
-    target: "1.8.0"                         # bridge
+    target: "main"                         # bridge
     alwaysRedoMigration: false
     migrationEnvFile: ".env.billing.example"  # bridge env has no DB credentials
     skipMigration: true
 
   remote-game-server-game:
     repoPath: "../remote-game-server"
-    target: "1.15.1"                        # game
+    target: "main"                        # game
     alwaysRedoMigration: false
     migrationEnvFile: ".env.billing.example"  # game env may lack postgres credentials
 

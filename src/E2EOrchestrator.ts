@@ -445,11 +445,22 @@ export class E2EOrchestrator {
     });
   }
 
+  private runAsyncOutput(cmd: string, cwd: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const proc = Bun.spawn(cmd.split(' '), { cwd, stdout: 'pipe', stderr: 'pipe' });
+      proc.exited.then(async () => {
+        const out = await new Response(proc.stdout).text();
+        if (proc.exitCode === 0) resolve(out.trim());
+        else reject(new Error(`Command failed: ${cmd}`));
+      });
+    });
+  }
+
   /**
    * Deduce the isolated DB names for a specific repo variant.
    * Suffix-based isolation ensures that 'bridge', 'game', etc., get their own logical DBs.
    */
-private deduceIsolatedNames(repoName: string, repoCfg?: RepoConfig, svc?: ComposeService) {
+  private deduceIsolatedNames(repoName: string, repoCfg?: RepoConfig, svc?: ComposeService) {
     const defaultDb = 'slot';
     const defaultMongo = 'rgs';
     const defaultRedis = 'slot-rgs';
@@ -492,7 +503,7 @@ private deduceIsolatedNames(repoName: string, repoCfg?: RepoConfig, svc?: Compos
         redisPrefix = regionType === 'billing' ? `${defaultRedis}_billing` : `${defaultRedis}_game`;
       }
     }
-    
+
     return { dbName, mongoName, redisPrefix };
   }
 
@@ -534,7 +545,7 @@ private deduceIsolatedNames(repoName: string, repoCfg?: RepoConfig, svc?: Compos
           if (idx !== -1) {
             const k = t.slice(0, idx).trim();
             let v = t.slice(idx + 1).trim();
-            
+
             // --- ADD THESE TWO LINES TO STRIP QUOTES ---
             if (v.startsWith('"') && v.endsWith('"')) v = v.slice(1, -1);
             else if (v.startsWith("'") && v.endsWith("'")) v = v.slice(1, -1);
@@ -545,12 +556,12 @@ private deduceIsolatedNames(repoName: string, repoCfg?: RepoConfig, svc?: Compos
       });
     }
 
-    const { dbName, mongoName, redisPrefix } = this.deduceIsolatedNames(repoName, repoCfg,svc);
+    const { dbName, mongoName, redisPrefix } = this.deduceIsolatedNames(repoName, repoCfg, svc);
 
     // --- ADD THIS LOGIC TO DEDUCE VERSION ---
-    // If target is a semver tag (e.g., 1.15.1), use it. 
+    // If target is a semver tag (e.g., 1.15.1), use it.
     // If it's a branch or SHA, you might want a fallback or the raw string.
-    const version = repoCfg?.target || 'v1'; 
+    const version = repoCfg?.target || 'v1';
 
     // Merge everything
     const merged: Record<string, string> = {
@@ -645,36 +656,130 @@ private deduceIsolatedNames(repoName: string, repoCfg?: RepoConfig, svc?: Compos
         fs.mkdirSync(this.worktreeBase, { recursive: true });
       }
       console.log('🌳 Provisioning Git Worktrees (Concurrently)...');
+
+      // ── Optimistic provisioning ───────────────────────────────────────────────
+      // Strategy:
+      //   Tags (semver x.y.z): local comparison only — immutable, zero network.
+      //   Branches (main / feature/x): ls-remote fires in background immediately.
+      //
+      // Phase 1 (this block): local comparisons for all + report results instantly.
+      //   Tags resolve in ~10ms. Branches report ✓ optimistically if local matches.
+      //   ls-remote runs concurrently in background, not awaited yet.
+      //
+      // Phase 2 (detectWarmStart, called right after): await pending branch checks.
+      //   If remote SHA differs from local → fetch + checkout that repo.
+      //   Fetched repos → build cache miss → warm start disabled → cold start.
+      //   Nothing done twice: expensive work (infra, migrations) hasn't started yet.
+      const isSemverTag = (t: string) => /^v?\d+\.\d+/.test(t);
+
+      // Fire all branch ls-remote Promises immediately, deduplicated by (repo, branch).
+      // They run concurrently while Phase 1 processes tags locally.
+      const pendingBranchChecks = new Map<
+        string,
+        Promise<{
+          repoName: string;
+          repoPath: string;
+          targetDir: string;
+          target: string;
+          needsFetch: boolean;
+        }>
+      >();
+
+      // ── Phase 1: local comparisons (instant) ─────────────────────────────────
       await Promise.all(
         Object.entries(orchestratorCfg.repos).map(async ([repoName, repo]) => {
           const targetDir = path.join(this.worktreeBase, repoName);
           const repoPath = path.resolve(repo.repoPath);
 
           if (fs.existsSync(path.join(targetDir, '.git'))) {
-            console.log(`   -> Updating ${repoName} @ ${repo.target}...`);
-            await this.runAsync('git fetch --all --tags', targetDir);
-            try {
-              // Try to checkout the latest remote branch tip in a detached state
-              await this.runAsync(`git checkout --detach origin/${repo.target}`, targetDir);
-            } catch {
-              // Fallback: If it's a Tag or a Commit SHA (short or full), this will succeed
-              await this.runAsync(`git checkout --detach ${repo.target}`, targetDir);
+            const headSha = await this.runAsyncOutput(
+              'git log -1 --format=%H HEAD',
+              targetDir,
+            ).catch(() => '');
+
+            if (isSemverTag(repo.target)) {
+              // Tag: local comparison only.
+              const localSha = await this.runAsyncOutput(
+                `git log -1 --format=%H ${repo.target}`,
+                repoPath,
+              ).catch(() => null);
+              if (localSha && headSha === localSha) {
+                console.log(`   -> ${repoName} @ ${repo.target} ✓ (${headSha.slice(0, 8)})`);
+                return;
+              }
+              // Local mismatch → fetch now.
+              console.log(`   -> Updating ${repoName} @ ${repo.target}...`);
+              await this.runAsync('git fetch --all --tags', targetDir);
+              try {
+                await this.runAsync(`git checkout --detach origin/${repo.target}`, targetDir);
+              } catch {
+                await this.runAsync(`git checkout --detach ${repo.target}`, targetDir);
+              }
+            } else {
+              // Branch: report optimistically based on local, fire background check.
+              const lsKey = `${repoPath}::${repo.target}`;
+              if (!pendingBranchChecks.has(lsKey)) {
+                // Start ls-remote immediately (background, not awaited here).
+                pendingBranchChecks.set(
+                  lsKey,
+                  this.runAsyncOutput(`git ls-remote origin refs/heads/${repo.target}`, repoPath)
+                    .then((out) => {
+                      const remoteSha = out.split('\n')[0]?.split('\t')[0]?.trim() || null;
+                      return {
+                        repoName,
+                        repoPath,
+                        targetDir,
+                        target: repo.target,
+                        needsFetch: !!remoteSha && headSha !== remoteSha,
+                      };
+                    })
+                    .catch(() => ({
+                      repoName,
+                      repoPath,
+                      targetDir,
+                      target: repo.target,
+                      needsFetch: false,
+                    })),
+                );
+              }
+              console.log(
+                `   -> ${repoName} @ ${repo.target} ✓ (${headSha.slice(0, 8)}, verifying remote...)`,
+              );
             }
           } else {
             console.log(`   -> Checking out ${repoName} @ ${repo.target}...`);
             if (fs.existsSync(targetDir)) fs.rmSync(targetDir, { recursive: true, force: true });
-            
             await this.runAsync('git fetch --all --tags', repoPath);
             try {
               await this.runAsync('git worktree prune', repoPath);
             } catch {}
-            
-            // The --detach flag forces a detached HEAD. This safely accepts branch names,
-            // tags, and any short/full SHA without creating local tracking branch conflicts!
             await this.runAsync(`git worktree add --detach ${targetDir} ${repo.target}`, repoPath);
           }
         }),
       );
+
+      // ── Phase 2: await branch remote checks (background since Phase 1 started) ─
+      // ls-remote has been running concurrently with Phase 1. It's likely already
+      // resolved. Any branch that needs updating is fetched here, before detectWarmStart
+      // evaluates cache freshness — so the build cache miss / warm-start invalidation
+      // happens naturally without special restart logic.
+      if (pendingBranchChecks.size > 0) {
+        const results = await Promise.all([...pendingBranchChecks.values()]);
+        const stale = results.filter((r) => r.needsFetch);
+        if (stale.length > 0) {
+          await Promise.all(
+            stale.map(async ({ repoName, targetDir, target }) => {
+              console.log(`   -> ${repoName} @ ${target}: remote has new commits — updating...`);
+              await this.runAsync('git fetch --all --tags', targetDir);
+              try {
+                await this.runAsync(`git checkout --detach origin/${target}`, targetDir);
+              } catch {
+                await this.runAsync(`git checkout --detach ${target}`, targetDir);
+              }
+            }),
+          );
+        }
+      }
     }
 
     await this.detectWarmStart();
@@ -748,7 +853,21 @@ private deduceIsolatedNames(repoName: string, repoCfg?: RepoConfig, svc?: Compos
     }
 
     console.log('🐳 Starting Infrastructure (Docker Compose)...');
-    const infraRepos = ['queue-service', 'remote-game-server'];
+
+    // Derive infra worktrees dynamically: find the first worktree per unique source
+    // repo that has a docker-compose.yml. Avoids hardcoded repo names that break
+    // when worktree keys are renamed (e.g. remote-game-server → remote-game-server-billing).
+    const seenRepoPaths = new Set<string>();
+    const infraRepos: string[] = [];
+    for (const [repoName, repo] of Object.entries(orchestratorCfg.repos)) {
+      const repoPath = path.resolve(repo.repoPath);
+      if (seenRepoPaths.has(repoPath)) continue;
+      seenRepoPaths.add(repoPath);
+      const worktreeDir = path.join(this.worktreeBase, repoName);
+      if (fs.existsSync(path.join(worktreeDir, 'docker-compose.yml'))) {
+        infraRepos.push(repoName);
+      }
+    }
 
     if (this.network) {
       console.log(`   -> Creating Docker network '${this.network}'...`);
@@ -792,12 +911,27 @@ private deduceIsolatedNames(repoName: string, repoCfg?: RepoConfig, svc?: Compos
         try {
           execSync(`nc -z -w 1 127.0.0.1 ${port}`, { stdio: 'ignore' });
 
-          // DARK MAGIC: If it's the Postgres port, verify the internal engine is actually READY
+          // Deeper readiness probes — port open ≠ service ready.
           if (port === 5437) {
-            // Attempt to connect and run a dummy query. If it's still "starting up", this fails.
             execSync(`docker exec $(docker ps -q -f "name=db-1") pg_isready -U postgres`, {
               stdio: 'ignore',
             });
+          }
+
+          if (port === 9093) {
+            // TCP open ≠ Kafka broker ready. Probe with kafka-topics.sh to confirm the
+            // broker has elected a controller and is ready for real connections.
+            // Kafka accepts TCP handshakes but resets them (ECONNRESET) until fully up.
+            const kafkaContainer = execSync(
+              "docker ps --format '{{.Names}}' | grep kafka-region | head -1",
+              { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] },
+            ).trim();
+            if (kafkaContainer) {
+              execSync(
+                `docker exec ${kafkaContainer} kafka-topics.sh --bootstrap-server localhost:9092 --list`,
+                { stdio: 'ignore' },
+              );
+            }
           }
 
           ready = true;
@@ -818,7 +952,9 @@ private deduceIsolatedNames(repoName: string, repoCfg?: RepoConfig, svc?: Compos
     this.printEnvironmentSummary();
 
     const targetsToRedo = this.flushDatabases();
-    const hasForcedRedo = Object.values(orchestratorCfg.repos).some((r) => r.alwaysRedoMigration) || targetsToRedo.size > 0;
+    const hasForcedRedo =
+      Object.values(orchestratorCfg.repos).some((r) => r.alwaysRedoMigration) ||
+      targetsToRedo.size > 0;
 
     if (this._warmStart && !hasForcedRedo) {
       console.log('⚡ Warm start: skipping migrations.');
@@ -840,7 +976,7 @@ private deduceIsolatedNames(repoName: string, repoCfg?: RepoConfig, svc?: Compos
       if (repoCfg?.skipMigration === true || !fs.existsSync(migrationsDir)) continue;
       reposMigrated.add(repo);
 
-      const { dbName, mongoName } = this.deduceIsolatedNames(repo, repoCfg,svc);
+      const { dbName, mongoName } = this.deduceIsolatedNames(repo, repoCfg, svc);
       const migrationEnv = this.buildEnvironment(worktreeDir, svc, repo, repoCfg, true);
 
       // --- REPLACE THE MINIMAL ENV HACK WITH THIS ---
@@ -881,8 +1017,11 @@ private deduceIsolatedNames(repoName: string, repoCfg?: RepoConfig, svc?: Compos
 
         // REDO Logic - Triggered by YAML flushData, alwaysRedoMigration, or a cache-miss
         // Notice this now cleanly checks target.name (e.g., slot_main) so it never wipes the wrong DB!
-        const targetNeedsRedo = repoCfg?.alwaysRedoMigration || targetsToRedo.has(target.name) || this._changedRepos.has(repo);
-        
+        const targetNeedsRedo =
+          repoCfg?.alwaysRedoMigration ||
+          targetsToRedo.has(target.name) ||
+          this._changedRepos.has(repo);
+
         if (targetNeedsRedo) {
           console.log(`   -> [REDO] Wiping ${target.name}...`);
           Bun.spawnSync([migrateBin, 'down', target.name, 'all'], {
@@ -954,7 +1093,7 @@ private deduceIsolatedNames(repoName: string, repoCfg?: RepoConfig, svc?: Compos
             }
             const repoCfg = orchestratorCfg.repos[repo];
             const mergedEnv = this.buildEnvironment(worktreeDir, svc, repo, repoCfg);
-            
+
             // --- ADD THIS HERE ---
             this.writePhysicalEnvFile(worktreeDir, mergedEnv);
 
@@ -1034,35 +1173,39 @@ private deduceIsolatedNames(repoName: string, repoCfg?: RepoConfig, svc?: Compos
         const ac = new AbortController();
         this.streamControllers.push(ac);
 
-        proc.stdout?.pipeTo(
-          new WritableStream({
-            write: (chunk) => {
-              const text = dec.decode(chunk);
-              serviceStream?.write(text);
-              masterStream?.write(`[${name}] ${text}`);
-              this._seq?.push(text, name, false);
-              if (verboseMode === true) process.stdout.write(`[${name}] ${text}`);
-            },
-          }),
-          { signal: ac.signal }
-        ).catch(() => {});
+        proc.stdout
+          ?.pipeTo(
+            new WritableStream({
+              write: (chunk) => {
+                const text = dec.decode(chunk);
+                serviceStream?.write(text);
+                masterStream?.write(`[${name}] ${text}`);
+                this._seq?.push(text, name, false);
+                if (verboseMode === true) process.stdout.write(`[${name}] ${text}`);
+              },
+            }),
+            { signal: ac.signal },
+          )
+          .catch(() => {});
 
-        proc.stderr?.pipeTo(
-          new WritableStream({
-            write: (chunk) => {
-              const text = dec.decode(chunk);
-              serviceStream?.write(text);
-              masterStream?.write(`[${name} ERR] ${text}`);
-              this._seq?.push(text, name, true);
-              if (verboseMode === true || verboseMode === 'errors')
-                process.stderr.write(`[${name} ERR] ${text}`);
-            },
-          }),
-          { signal: ac.signal }
-        ).catch(() => {});
+        proc.stderr
+          ?.pipeTo(
+            new WritableStream({
+              write: (chunk) => {
+                const text = dec.decode(chunk);
+                serviceStream?.write(text);
+                masterStream?.write(`[${name} ERR] ${text}`);
+                this._seq?.push(text, name, true);
+                if (verboseMode === true || verboseMode === 'errors')
+                  process.stderr.write(`[${name} ERR] ${text}`);
+              },
+            }),
+            { signal: ac.signal },
+          )
+          .catch(() => {});
 
         this.activeProcesses.push(proc);
-proc.unref();
+        proc.unref();
 
         if (hcUrl) {
           const hcPromise = this.pollHealthCheck(name, hcUrl);
@@ -1101,7 +1244,7 @@ proc.unref();
     this._seq?.stop();
 
     // Sever all active log streams so the Bun event loop can close
-    this.streamControllers.forEach(ac => ac.abort());
+    this.streamControllers.forEach((ac) => ac.abort());
 
     const forceTeardown = process.env.E2E_TEARDOWN === '1';
     if (!orchestratorCfg.global.cleanOnTeardown && !forceTeardown) {
@@ -1198,11 +1341,12 @@ proc.unref();
       const repo = svc['x-repo'];
       if (!repo) continue;
       const repoCfg = orchestratorCfg.repos[repo];
-      const { dbName, mongoName } = this.deduceIsolatedNames(repo, repoCfg,svc);
+      const { dbName, mongoName } = this.deduceIsolatedNames(repo, repoCfg, svc);
 
       const flushCfg = {
         mongo: repoCfg?.flushData?.mongo ?? orchestratorCfg.global.flushData?.mongo ?? false,
-        postgres: repoCfg?.flushData?.postgres ?? orchestratorCfg.global.flushData?.postgres ?? false,
+        postgres:
+          repoCfg?.flushData?.postgres ?? orchestratorCfg.global.flushData?.postgres ?? false,
       };
 
       if (flushCfg.mongo && mongoName) mongoDbsToDrop.add(mongoName);
@@ -1215,7 +1359,11 @@ proc.unref();
 
     if (mongoDbsToDrop.size > 0) {
       try {
-        const mongoContainers = execSync(`docker ps -q -f "name=mongo"`).toString().trim().split('\n').filter(Boolean);
+        const mongoContainers = execSync(`docker ps -q -f "name=mongo"`)
+          .toString()
+          .trim()
+          .split('\n')
+          .filter(Boolean);
         if (mongoContainers.length > 0) {
           for (const mongoName of mongoDbsToDrop) {
             console.log(`   -> Dropping Mongo DB: ${mongoName}`);
@@ -1226,21 +1374,24 @@ proc.unref();
             for (const cid of mongoContainers) {
               try {
                 const cmd = `CMD="mongosh"; which mongosh >/dev/null 2>&1 || CMD="mongo"; $CMD -u root -p root --authenticationDatabase admin ${mongoName} --quiet --eval "db.dropDatabase()" || $CMD ${mongoName} --quiet --eval "db.dropDatabase()"`;
-                
+
                 // Use input pipe to execute safely
-                execSync(`docker exec -i ${cid} sh`, { input: cmd, stdio: ['pipe', 'pipe', 'pipe'] });
-                
+                execSync(`docker exec -i ${cid} sh`, {
+                  input: cmd,
+                  stdio: ['pipe', 'pipe', 'pipe'],
+                });
+
                 success = true;
-                targetsToRedo.add(mongoName); 
+                targetsToRedo.add(mongoName);
                 break; // Primary found and dropped, move to next database!
               } catch (e: any) {
                 const errText = e.stderr ? e.stderr.toString() : '';
-                
+
                 // --- UPDATE THIS LINE ---
                 if (errText.includes('not primary') || errText.includes('ECONNREFUSED')) {
                   continue; // This is a secondary node or an arbiter, try the next container
                 }
-                
+
                 lastErr = errText;
               }
             }
@@ -1268,7 +1419,7 @@ proc.unref();
       const repo = svc['x-repo'];
       if (!repo) continue;
       const repoCfg = orchestratorCfg.repos[repo];
-      const { redisPrefix } = this.deduceIsolatedNames(repo, repoCfg,svc);
+      const { redisPrefix } = this.deduceIsolatedNames(repo, repoCfg, svc);
 
       const flush = repoCfg?.flushData?.redis ?? orchestratorCfg.global.flushData?.redis ?? false;
       if (flush && redisPrefix) toFlushRedis.add(redisPrefix);
@@ -1281,7 +1432,7 @@ proc.unref();
         if (containerId) {
           for (const prefix of toFlushRedis) {
             console.log(`   -> Scanning Redis cluster for prefix: ${prefix}:*`);
-            
+
             // Clean multi-line bash script that tallies and prints every key found
             const script = `
               cli=$(which valkey-cli >/dev/null 2>&1 && echo valkey-cli || echo redis-cli)
@@ -1307,10 +1458,13 @@ proc.unref();
                 echo "   ℹ️  No existing keys found for prefix ${prefix}:*"
               fi
             `;
-            
+
             try {
               // Capture the stdout buffer and print it so you see the exact keys and the total!
-              const output = execSync(`docker exec -i ${containerId} sh`, { input: script, stdio: ['pipe', 'pipe', 'pipe'] });
+              const output = execSync(`docker exec -i ${containerId} sh`, {
+                input: script,
+                stdio: ['pipe', 'pipe', 'pipe'],
+              });
               console.log(output.toString().replace(/\n$/, ''));
             } catch (e: any) {
               console.warn(`   ⚠️  Failed to clear Redis prefix ${prefix}:*`);
@@ -1318,8 +1472,8 @@ proc.unref();
             }
           }
         }
-      } catch (e: any) { 
-        console.warn('   ⚠️  Failed to execute Redis flush.'); 
+      } catch (e: any) {
+        console.warn('   ⚠️  Failed to execute Redis flush.');
         if (e.stderr) console.warn(`      Error: ${e.stderr.toString().trim()}`);
       }
     }
@@ -1328,19 +1482,19 @@ proc.unref();
   private printEnvironmentSummary() {
     console.log('\n🌍 Service Environment Topologies:');
     const summary = [];
-    
+
     for (const [name, svc] of Object.entries(composeServices)) {
       const repo = svc['x-repo'];
       if (!repo) continue;
-      
+
       const repoCfg = orchestratorCfg.repos[repo];
       const { dbName, mongoName, redisPrefix } = this.deduceIsolatedNames(repo, repoCfg, svc);
       const port = hostPort(svc.ports);
-      
+
       summary.push({
         Service: name,
         'Repo Variant': repo,
-        Target: repoCfg?.target || '-',   // <-- ADD THIS LINE
+        Target: repoCfg?.target || '-', // <-- ADD THIS LINE
         Port: port || '-',
         Postgres: dbName,
         Mongo: mongoName,
@@ -1367,7 +1521,7 @@ proc.unref();
         return `${k}=${strVal}`; // Write naked strings (Bash friendly!)
       })
       .join('\n');
-      
+
     fs.writeFileSync(path.join(worktreeDir, '.env'), content);
   }
 }

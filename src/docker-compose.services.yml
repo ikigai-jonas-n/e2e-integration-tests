@@ -40,8 +40,8 @@ services:
 
   # ── remote-game-server ──────────────────────────────────────────────────────
   billing:
-    x-repo: remote-game-server
-    # x-repo: remote-game-server-billing
+    # x-repo: remote-game-server
+    x-repo: remote-game-server-billing
     x-env-file: .env.billing.example
     x-setup:
       - npm install
@@ -76,8 +76,8 @@ services:
       retries: 30
 
   game:
-      x-repo: remote-game-server
-      # x-repo: remote-game-server-game
+      # x-repo: remote-game-server
+      x-repo: remote-game-server-game
       x-env-file: .env.game.example
       x-setup:
         - npm install
@@ -118,8 +118,8 @@ services:
         retries: 30
 
   bridge:
-      x-repo: remote-game-server
-      # x-repo: remote-game-server-bridge
+      # x-repo: remote-game-server
+      x-repo: remote-game-server-bridge
       x-env-file: .env.bridge.example
       x-setup:
         - npm install
@@ -143,8 +143,7 @@ services:
           condition: service_healthy
 
   game-activity:
-    x-repo: remote-game-server
-    # x-repo: remote-game-server-no-db     # main branch — triggers build for jobs too
+    x-repo: remote-game-server-no-db     # main branch — triggers build for jobs too
     x-env-file: .env.game-activity.example
     x-setup:
       - npm install
@@ -166,8 +165,7 @@ services:
       retries: 30
 
   job-stale-rounds:
-    x-repo: remote-game-server
-    # x-repo: remote-game-server-no-db
+    x-repo: remote-game-server-no-db
     x-env-file: .env.job.example
     x-bridge-env:
       QUEUE_HOST_NAMES: "kafka-region:9093"
@@ -190,8 +188,7 @@ services:
         condition: service_healthy
 
   job-close-inactive:
-    x-repo: remote-game-server
-    # x-repo: remote-game-server-no-db
+    x-repo: remote-game-server-no-db
     x-env-file: .env.job.example
     x-bridge-env:
       QUEUE_HOST_NAMES: "kafka-region:9093"
