@@ -5,8 +5,8 @@
   "main": "index.js",
   "scripts": {
     "test": "./run-e2e.sh",
-    "test:raw": "bun test --timeout 600000",
-    "test:fast": "bun test --timeout ${E2E_FAST_TIMEOUT_MS:-1000}",
+    "test:raw": "bun test",
+"test:fast": "bun test --timeout ${E2E_FAST_TIMEOUT_MS:-1000}",
     "setup:env": "bun run scripts/dev-services.ts",
     "reset": "bash scripts/reset.sh",
     "lint": "bun run type:check && bun run prettier:check && bun run lint:code",

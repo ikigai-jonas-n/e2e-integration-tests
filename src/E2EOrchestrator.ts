@@ -227,6 +227,7 @@ class SeqForwarder {
 
 export class E2EOrchestrator {
   private activeProcesses: any[] = [];
+  private _changedRepos = new Set<string>(); // <-- ADD THIS
   private worktreeBase = path.resolve(orchestratorCfg.global.worktreeBasePath);
   private npmCacheDir = path.resolve('./.e2e-npm-cache');
   private _warmStart = false;
@@ -369,9 +370,12 @@ export class E2EOrchestrator {
       const svcDir = path.join(this.worktreeBase, repo);
       if (!fs.existsSync(path.join(svcDir, '.git'))) continue;
       const status = this.buildCacheStatus(svcDir);
-      const cached = status === 'up-to-date';
-      if (!cached) allCached = false;
-      console.log(`   ${repo.padEnd(24)} ${cached ? '⚡ cached' : `🔄 ${status}`}`);
+    const cached = status === 'up-to-date';
+    if (!cached) {
+      allCached = false;
+      this._changedRepos.add(repo); // <-- ADD THIS
+    }
+    console.log(`   ${repo.padEnd(24)} ${cached ? '⚡ cached' : `🔄 ${status}`}`);
     }
 
     this._warmStart = servicesHealthy && allCached;
@@ -833,8 +837,8 @@ export class E2EOrchestrator {
           this.createCappedMigrationDir(sourcePath, targetPath, repoCfg.untilMigrationFile);
         }
 
-        // REDO Logic
-        if (repoCfg?.alwaysRedoMigration) {
+        // REDO Logic - CHANGE the condition here:
+        if (repoCfg?.alwaysRedoMigration || this._changedRepos.has(repo)) {
           console.log(`   -> [REDO] Wiping ${target.name}...`);
           Bun.spawnSync([migrateBin, 'down', target.name, 'all'], {
             cwd: worktreeDir,
