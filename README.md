@@ -30,9 +30,10 @@ To **force a full stop** (one-off):
 E2E_TEARDOWN=1 bun test
 ```
 
-To make teardown permanent, edit `e2e-config.json`:
-```json
-{ "global": { "cleanOnTeardown": true } }
+To make teardown permanent, edit `e2e-orchestrator.yml`:
+```yaml
+global:
+  cleanOnTeardown: true
 ```
 
 This is the only change needed — no code changes required.
@@ -54,10 +55,11 @@ E2E_SKIP_PULL=1 bun test
 ```
 Do **not** use in CI. CI must always pull latest.
 
-**`global.network`** — set in `e2e-config.json` → `"global"` → `"network"`.
+**`global.network`** — set in `e2e-orchestrator.yml` → `global.network`.
 `null` = host networking (default). `"e2e-net"` = Docker bridge mode (see Bridge Network section).
-```json
-{ "global": { "network": null } }
+```yaml
+global:
+  network: null
 ```
 
 ---
@@ -95,7 +97,7 @@ bun install
 bun test
 ```
 
-No `.env` file needed. All configuration lives in `e2e-config.json`.
+No `.env` file needed. Configuration lives in `e2e-orchestrator.yml` and `docker-compose.services.yml`.
 
 First run takes ~2-3 minutes (git checkout + npm install + build + docker up).
 **Every subsequent run auto-detects warm state and completes in < 5 seconds** when services are already running and code hasn't changed.
@@ -219,60 +221,57 @@ The cache stamp (`.e2e-state.json`) is written per repo after a successful build
 
 ---
 
-## Configuration (`e2e-config.json`)
+## Configuration
 
-### Top-level structure
+There are two config files. Edit them to adjust how the test suite runs.
 
-```json
-{
-  "global": { ... },
-  "services": { ... }
-}
-```
+### `e2e-orchestrator.yml` — harness settings
 
-### `global`
+Controls how the orchestrator provisions and manages infrastructure.
 
-| Field | Type | Default | Description |
-|---|---|---|---|
-| `worktreeBasePath` | `string` | `"./.e2e-worktrees"` | Where git worktrees are checked out |
-| `cleanOnTeardown` | `boolean` | `false` | Delete worktrees after test run |
-| `network` | `string \| null` | `null` | Docker network name for bridge mode. `null` = host networking (default) |
-| `verbose` | `false \| true \| "errors"` | `false` | Controls service log visibility. Service logs are **always written to the log file**. `false` = log file only (clean terminal). `true` = log file + terminal (full noise). `"errors"` = stderr to terminal (see crashes live), stdout to log file only (no INFO/DEBUG flood). |
-
-### `services[name]`
-
-| Field | Type | Description |
+| Field | Default | Description |
 |---|---|---|
-| `repoPath` | `string` | Relative path to the source repo (sibling directory) |
-| `target` | `string` | Branch or commit to check out |
-| `composeServiceEnvOverrides` | `object` | Env var overrides per docker-compose service name, applied when `global.network` is set |
-| `instances` | `array` | One or more process instances to run |
+| `global.worktreeBasePath` | `./.e2e-worktrees` | Where git repos are checked out |
+| `global.cleanOnTeardown` | `false` | Keep services alive after run (enables warm start) |
+| `global.network` | `null` | `null` = host networking. `"e2e-net"` = Docker bridge mode |
+| `global.verbose` | `false` | `false` = logs to file only. `"errors"` = stderr to terminal too. `true` = everything to terminal |
+| `repos.<name>.repoPath` | — | Sibling repo path |
+| `repos.<name>.target` | `"main"` | Branch to check out |
+| `composeServiceEnvOverrides` | — | Docker container env overrides for bridge network mode |
 
-### `services[name].instances[i]`
+### `docker-compose.services.yml` — service definitions
 
-| Field | Type | Description |
-|---|---|---|
-| `name` | `string` | Human-readable instance name (used in logs) |
-| `count` | `number` | How many copies to start. Use `{INDEX}` in `envOverrides` values |
-| `envBase` | `string` | Path to the `.env.*.example` file to use as base |
-| `envOverrides` | `object` | Key/value overrides applied on top of `envBase` |
-| `networkEnvOverrides` | `object` | Additional overrides applied only when `global.network` is set (bridge mode) |
-| `commands` | `array` | Commands to run. `sync: true` = run before starting (install/build). `sync: false` = run as long-lived process |
-| `healthCheck` | `string` | URL polled until 200 before tests begin |
+Defines every Node.js service: command, ports, environment, health check, and startup dependencies.
+
+Standard Docker Compose fields:
+
+| Field | Description |
+|---|---|
+| `command` | The long-lived process to spawn |
+| `environment` | Base environment variables |
+| `ports` | `"hostPort:containerPort"` — orchestrator uses the host port |
+| `healthcheck.test` | Orchestrator polls the `http://` URL until 200 |
+| `depends_on` | Service must be healthy before this one starts |
+
+Orchestrator-hint fields (Docker Compose ignores `x-*`):
+
+| Field | Description |
+|---|---|
+| `x-repo` | Which worktree the source lives in |
+| `x-env-file` | `.env.*.example` base file (relative to worktree) |
+| `x-setup` | One-time build commands (cached by git hash) |
+| `x-bridge-env` | Extra env applied when `global.network` is set |
 
 ### Changing the branch under test
 
-```json
-{
-  "services": {
-    "remote-game-server": {
-      "target": "feature/my-awesome-feature"
-    }
-  }
-}
+Edit `e2e-orchestrator.yml`:
+```yaml
+repos:
+  remote-game-server:
+    target: "feature/my-awesome-feature"
 ```
 
-The orchestrator pulls the specified branch into its git worktree. The build cache invalidates automatically because HEAD changes.
+The build cache invalidates automatically because HEAD changes.
 
 ---
 
@@ -304,13 +303,10 @@ By default the orchestrator uses `network_mode: "host"` so all services share `l
 
 To run with Docker bridge network isolation (e.g. stricter CI environments):
 
-**1. Set `global.network` in `e2e-config.json`:**
-```json
-{
-  "global": {
-    "network": "e2e-net"
-  }
-}
+**1. Set `global.network` in `e2e-orchestrator.yml`:**
+```yaml
+global:
+  network: "e2e-net"
 ```
 
 **2. Update `docker-compose.e2e.yml`** — comment out `network_mode: "host"`, uncomment the bridge network section (see comments in that file).
@@ -324,18 +320,17 @@ The Valkey cluster startup script inside `remote-game-server/docker-compose.yml`
 - Generates `docker-compose.override.yml` files that attach all containers to the network and override Kafka's `KAFKA_CFG_ADVERTISED_LISTENERS` to use container names
 - Merges `networkEnvOverrides` from each instance into its environment, repointing all `localhost` connection strings to container names
 
-The `networkEnvOverrides` in `e2e-config.json` already contain the full bridge-mode mapping for all services (Kafka, Redis, MongoDB, Postgres, RustFS).
+The `x-bridge-env` fields in `docker-compose.services.yml` already contain the full bridge-mode mapping for all services (Kafka, Redis, MongoDB, Postgres, RustFS).
 
 ---
 
 ## Ports
 
-Ports are derived dynamically from `e2e-config.json` at startup. No hardcoded list.
+Ports come from `ports:` entries in `docker-compose.services.yml` (e.g. `"8080:8080"` → port 8080). No regex scanning needed.
 
-The orchestrator scans:
-- `envOverrides` keys containing `PORT` (e.g. `PORT=8080`, `RGS_PORT=8090`)
-- `localhost` URLs in `envOverrides` values (e.g. `http://127.0.0.1:9000`)
-- `healthCheck` URLs
+After a successful start, the orchestrator prints a service endpoint table and writes two files:
+- `.e2e-endpoints.json` — machine-readable `{ "billing": "http://127.0.0.1:8080", ... }`
+- `E2E_Local.postman_environment.json` — drag-and-drop into Postman for manual API testing
 
 macOS AirPlay conflicts on port 7000/7001 are patched automatically in the docker-compose files (remapped to 7002/7003).
 
@@ -388,14 +383,27 @@ The test suite polls the game node's process cache instead of using a fixed slee
 
 ```
 e2e-integration-tests/
-├── e2e-config.json          ← all service/instance/network configuration
-├── tests/
-│   └── e2e.spec.ts          ← test flows (smoke, Flow 1, Flow 2)
+├── e2e-orchestrator.yml         ← harness settings: repos, global flags, bridge-mode overrides
+├── docker-compose.services.yml  ← service definitions: command, ports, env, healthcheck, depends_on
 ├── src/
-│   └── E2EOrchestrator.ts   ← spins up all services, manages lifecycle
-├── run-e2e.sh               ← wrapper: creates timestamped log in logs/
-├── docker-compose.e2e.yml   ← CI: runs orchestrator in a container
-├── Dockerfile.e2e           ← CI: builds the orchestrator container image
-├── logs/                    ← e2e-run-TIMESTAMP.log (gitignored)
-└── .e2e-worktrees/          ← git worktrees (gitignored)
+│   └── E2EOrchestrator.ts       ← reads both YAMLs, spins up services, manages lifecycle
+├── tests/
+│   ├── e2e.spec.ts              ← root: beforeAll/afterAll + all describe suites
+│   ├── specs/                   ← individual test suites (export runXxx functions)
+│   └── utils/
+│       ├── api.ts               ← fetch wrappers, log helpers, waitForCondition, propagateConfig
+│       └── config.ts            ← BILLING/GAME URLs (parsed from docker-compose.services.yml)
+├── run-e2e.sh                   ← wrapper: creates logs/<timestamp>/ folder, splits per-suite logs
+├── docker-compose.e2e.yml       ← CI: runs orchestrator in a container
+├── Dockerfile.e2e               ← CI: builds the orchestrator container image
+└── logs/
+    └── <timestamp>/
+        ├── _master.log          ← all output (test + service logs)
+        ├── _failures.log        ← failure summary with log file pointers (on failure)
+        ├── billing-8080.log     ← per-service raw output
+        ├── game-19080.log
+        ├── ...
+        ├── test_service-apis.log        ← per-suite test output
+        ├── test_flow-bet-action.log
+        └── ...
 ```

@@ -53,19 +53,67 @@ afterAll(async () => {
   await orchestrator.teardown();
 }, 60000);
 
+// ── Suite marker helpers ───────────────────────────────────────────────────────
+// run-e2e.sh parses __E2E_SUITE_START__/<END__ markers to split per-suite log files.
+function suiteMarkers(slug: string) {
+  return {
+    beforeAll: () => process.stdout.write(`__E2E_SUITE_START__:${slug}\n`),
+    afterAll:  () => process.stdout.write(`__E2E_SUITE_END__:${slug}\n`),
+  };
+}
+
 // ==========================================
 // UNIT-TEST STYLE — individual endpoints
 // ==========================================
-describe('Service APIs   (/v2/service/*)',  runServiceTests);
-describe('Internal APIs  (/v1/internal/*)', runInternalTests);
-describe('Experience APIs (/v2/exp/*)',     runExpTests);
+describe('Service APIs   (/v2/service/*)', () => {
+  const m = suiteMarkers('service-apis');
+  beforeAll(m.beforeAll);
+  afterAll(m.afterAll);
+  runServiceTests();
+});
+
+describe('Internal APIs  (/v1/internal/*)', () => {
+  const m = suiteMarkers('internal-apis');
+  beforeAll(m.beforeAll);
+  afterAll(m.afterAll);
+  runInternalTests();
+});
+
+describe('Experience APIs (/v2/exp/*)', () => {
+  const m = suiteMarkers('experience-apis');
+  beforeAll(m.beforeAll);
+  afterAll(m.afterAll);
+  runExpTests();
+});
 
 // ==========================================
 // FLOW SPECS — full lifecycle tests
 // ==========================================
-describe('Flow: Bet + Action',            runBetAndActionFlow);
-describe('Flow: Lobby Session Token',     runLobbyFlowTests);
-describe('Flow: Game Maintenance',        runMaintenanceFlowTests);
+describe('Flow: Bet + Action', () => {
+  const m = suiteMarkers('flow-bet-action');
+  beforeAll(m.beforeAll);
+  afterAll(m.afterAll);
+  runBetAndActionFlow();
+});
+
+describe('Flow: Lobby Session Token', () => {
+  const m = suiteMarkers('flow-lobby');
+  beforeAll(m.beforeAll);
+  afterAll(m.afterAll);
+  runLobbyFlowTests();
+});
+
+describe('Flow: Game Maintenance', () => {
+  const m = suiteMarkers('flow-maintenance');
+  beforeAll(m.beforeAll);
+  afterAll(m.afterAll);
+  runMaintenanceFlowTests();
+});
 
 // Bridge flow last — it disables / re-enables LGS-001 (may affect cron state)
-describe('Flow: Bridge & State Propagation', runBridgeFlowTests);
+describe('Flow: Bridge & State Propagation', () => {
+  const m = suiteMarkers('flow-bridge');
+  beforeAll(m.beforeAll);
+  afterAll(m.afterAll);
+  runBridgeFlowTests();
+});

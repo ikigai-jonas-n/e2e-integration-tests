@@ -1,14 +1,18 @@
-import config from '../../e2e-config.json';
+import { readFileSync } from 'fs';
+import path from 'path';
+import { parse as parseYaml } from 'yaml';
+
+// Derive service base URLs from docker-compose.services.yml ports.
+// Synchronous at module-load time — works before the orchestrator runs.
+const composed = parseYaml(
+  readFileSync(path.resolve('./docker-compose.services.yml'), 'utf-8'),
+) as { services: Record<string, { ports?: string[] }> };
 
 export function instanceBase(name: string): string {
-  for (const svc of Object.values(config.services)) {
-    const inst = (svc as any).instances?.find((i: any) => i.name === name);
-    if (inst?.healthCheck) {
-      const m = inst.healthCheck.match(/^(https?:\/\/[^\/]+)/);
-      if (m) return m[1];
-    }
-  }
-  throw new Error(`Instance '${name}' not found in e2e-config.json`);
+  const svc  = composed.services?.[name];
+  const port = svc?.ports?.[0]?.split(':')?.[0];
+  if (!port) throw new Error(`Service '${name}' not found in docker-compose.services.yml`);
+  return `http://127.0.0.1:${port}`;
 }
 
 export const BILLING = instanceBase('billing');

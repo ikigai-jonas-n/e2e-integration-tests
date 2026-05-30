@@ -1,234 +1,274 @@
 import fs from 'fs';
 import path from 'path';
+import { readFileSync } from 'fs';
 import { execSync } from 'node:child_process';
 import axios from 'axios';
-import config from '../e2e-config.json';
+import { parse as parseYaml } from 'yaml';
 
-interface CommandDef { run: string; sync: boolean; }
+// ─── e2e-orchestrator.yml types ───────────────────────────────────────────────
+
+interface OrchestratorGlobal {
+  worktreeBasePath: string;
+  cleanOnTeardown: boolean;
+  verbose: boolean | 'errors';
+  network: string | null;
+}
+
+interface RepoConfig {
+  repoPath: string;
+  target: string;
+}
+
+interface OrchestratorConfig {
+  global: OrchestratorGlobal;
+  repos: Record<string, RepoConfig>;
+  composeServiceEnvOverrides?: Record<string, Record<string, Record<string, string>>>;
+}
+
+// ─── docker-compose.services.yml types ───────────────────────────────────────
+
+interface ComposeService {
+  // Orchestrator hints (x-* fields — Docker Compose ignores these)
+  'x-repo': string;
+  'x-env-file': string;
+  'x-setup'?: string[];
+  'x-bridge-env'?: Record<string, string>;
+  // Standard Docker Compose fields
+  command: string;
+  environment?: Record<string, string> | string[];
+  ports?: string[];
+  healthcheck?: { test: string[] };
+  depends_on?: string[] | Record<string, { condition?: string }>;
+}
+
+// ─── Load configs ─────────────────────────────────────────────────────────────
+
+const orchestratorCfg = parseYaml(
+  readFileSync(path.resolve('./e2e-orchestrator.yml'), 'utf-8'),
+) as OrchestratorConfig;
+
+const composeServices = (parseYaml(
+  readFileSync(path.resolve('./docker-compose.services.yml'), 'utf-8'),
+) as { services: Record<string, ComposeService> }).services;
+
+// ─── Helpers ─────────────────────────────────────────────────────────────────
+
+/** Normalise Docker Compose environment to a flat map. Handles both map and array forms. */
+function parseEnv(env: Record<string, string> | string[] | null | undefined): Record<string, string> {
+  if (!env) return {};
+  if (Array.isArray(env)) {
+    return Object.fromEntries(
+      env.map(item => { const [k, ...v] = String(item).split('='); return [k, v.join('=')]; }),
+    );
+  }
+  return Object.fromEntries(Object.entries(env).map(([k, v]) => [k, String(v)]));
+}
+
+/** Extract host port number from a ports entry like "8080:8080". */
+function hostPort(ports: string[] | undefined): number | null {
+  if (!ports?.length) return null;
+  return parseInt(String(ports[0]).split(':')[0], 10) || null;
+}
+
+/** Extract the http:// healthcheck URL from healthcheck.test args. */
+function healthCheckUrl(svc: ComposeService): string | null {
+  const args = svc.healthcheck?.test;
+  if (!args) return null;
+  return args.find(a => a.startsWith('http://') || a.startsWith('https://')) ?? null;
+}
+
+/** Return list of service names this service depends on. */
+function dependsOn(svc: ComposeService): string[] {
+  const d = svc.depends_on;
+  if (!d) return [];
+  if (Array.isArray(d)) return d as string[];
+  return Object.keys(d);
+}
+
+// ─── Orchestrator ─────────────────────────────────────────────────────────────
 
 export class E2EOrchestrator {
   private activeProcesses: any[] = [];
-  private worktreeBase = path.resolve(config.global.worktreeBasePath);
+  private worktreeBase = path.resolve(orchestratorCfg.global.worktreeBasePath);
   private npmCacheDir  = path.resolve('./.e2e-npm-cache');
-
-  /**
-   * Computed once at the end of setupWorktrees().
-   * true  → services are healthy AND all repos have unchanged code → skip infra/migrations/restarts.
-   * false → something changed or services are down → do full startup.
-   */
-  private _warmStart: boolean = false;
-
-  /**
-   * E2E_SKIP_PULL=1 — skip git pull only.
-   * Use when testing local uncommitted changes you don't want to clobber with `git reset --hard`.
-   * Everything else (warm-start, build cache, etc.) still applies.
-   */
+  private _warmStart   = false;
   private readonly skipPull = process.env.E2E_SKIP_PULL === '1';
 
-  // ─── Verbose mode ───────────────────────────────────────────────────────────
+  private _masterStream: ReturnType<typeof fs.createWriteStream> | null = null;
 
-  /**
-   * Controls whether service logs appear on the terminal.
-   *   false      (default) — service stdout+stderr → log file only
-   *   true                 — service stdout+stderr → log file AND terminal
-   *   "errors"             — service stderr → log file AND terminal (crash-visible);
-   *                          service stdout → log file only (no INFO/DEBUG flood)
-   *
-   * Service logs are ALWAYS written to the log file regardless of this setting.
-   */
+  // ─── Verbose ──────────────────────────────────────────────────────────────
+
   private get verbose(): boolean | 'errors' {
-    const v = (config.global as any).verbose;
+    const v = orchestratorCfg.global.verbose;
     if (v === 'errors') return 'errors';
     return v === true;
   }
 
-  /** Returns a WriteStream appending to the log file, or null if not running via run-e2e.sh. */
-  private openServiceLogStream(): ReturnType<typeof fs.createWriteStream> | null {
-    const logFile = process.env.E2E_LOG_FILE;
-    if (!logFile) return null;
-    return fs.createWriteStream(logFile, { flags: 'a' });
+  // ─── Log directory ────────────────────────────────────────────────────────
+
+  /** Timestamped folder set by run-e2e.sh via E2E_LOG_DIR=logs/<timestamp> */
+  private get logDir(): string | null {
+    return process.env.E2E_LOG_DIR ?? null;
   }
 
-  // ─── Network ────────────────────────────────────────────────────────────────
+  private ensureMasterStream(): ReturnType<typeof fs.createWriteStream> | null {
+    if (!this.logDir) return null;
+    if (!this._masterStream) {
+      this._masterStream = fs.createWriteStream(path.join(this.logDir, '_master.log'), { flags: 'a' });
+    }
+    return this._masterStream;
+  }
+
+  /** Per-service log: logs/<timestamp>/<name>-<port>.log */
+  private openServiceStream(name: string, port: number): ReturnType<typeof fs.createWriteStream> | null {
+    if (!this.logDir) return null;
+    return fs.createWriteStream(path.join(this.logDir, `${name}-${port}.log`), { flags: 'a' });
+  }
+
+  // ─── Network ──────────────────────────────────────────────────────────────
 
   private get network(): string | null {
-    return (config.global as any).network ?? null;
+    return orchestratorCfg.global.network ?? null;
   }
 
-  // ─── Port resolution ────────────────────────────────────────────────────────
+  // ─── Ports to clear on cold start ─────────────────────────────────────────
 
   private get portsToClear(): number[] {
-    const ports = new Set<number>();
-    for (const svc of Object.values(config.services)) {
-      for (const inst of svc.instances) {
-        for (const [key, value] of Object.entries(inst.envOverrides || {})) {
-          const v = String(value);
-          if (/PORT/i.test(key)) {
-            const p = parseInt(v, 10);
-            if (p > 1024 && p < 65536) ports.add(p);
-          }
-          for (const m of v.matchAll(/:\/\/(?:localhost|127\.0\.0\.1)[^:]*:(\d+)/g)) {
-            const p = parseInt(m[1], 10);
-            if (p > 1024) ports.add(p);
-          }
-        }
-        if (inst.healthCheck) {
-          const m = inst.healthCheck.match(/:\/\/[^:]+:(\d+)/);
-          if (m) ports.add(parseInt(m[1], 10));
-        }
-      }
-    }
-    return [...ports].sort((a, b) => a - b);
+    return Object.values(composeServices)
+      .map(s => hostPort(s.ports))
+      .filter((p): p is number => p !== null)
+      .sort((a, b) => a - b);
   }
 
-  // ─── Build cache (commit-hash keyed) ────────────────────────────────────────
+  // ─── Build cache ──────────────────────────────────────────────────────────
 
   private readonly STATE_FILE = '.e2e-state.json';
 
-  /**
-   * Returns a two-part cache key: committed HEAD + a hash of any uncommitted diff.
-   * Detects BOTH "new commit pulled" and "local files changed without committing".
-   */
-  private getBuildKey(worktreeDir: string): { commit: string; dirty: string } | null {
+  private getBuildKey(dir: string): { commit: string; dirty: string } | null {
     try {
-      const commit = execSync('git rev-parse HEAD', { cwd: worktreeDir }).toString().trim();
-      // Diff only source & package files — exclude docker-compose.yml (orchestrator mutates it
-      // for port remapping, which would otherwise bust the cache on every run).
-      const diff = execSync(
+      const commit = execSync('git rev-parse HEAD', { cwd: dir }).toString().trim();
+      const diff   = execSync(
         'git diff HEAD -- ":(exclude)*docker-compose*" ":(exclude)*.env*"',
-        { cwd: worktreeDir },
+        { cwd: dir },
       ).toString();
-      // Simple djb2-style hash over the diff text — no external tooling needed
       let h = 5381;
       for (let i = 0; i < diff.length; i++) h = ((h << 5) + h) ^ diff.charCodeAt(i);
-      const dirty = (h >>> 0).toString(16);  // unsigned 32-bit hex
-      return { commit, dirty };
+      return { commit, dirty: (h >>> 0).toString(16) };
     } catch { return null; }
   }
 
-  private isBuildCached(worktreeDir: string): boolean {
-    const stateFile   = path.join(worktreeDir, this.STATE_FILE);
-    const nodeModules = path.join(worktreeDir, 'node_modules');
-    const buildIndex  = path.join(worktreeDir, 'build', 'index.js');
-    if (!fs.existsSync(stateFile) || !fs.existsSync(nodeModules) || !fs.existsSync(buildIndex)) {
-      return false;
-    }
+  private isBuildCached(dir: string): boolean {
+    if (
+      !fs.existsSync(path.join(dir, this.STATE_FILE))     ||
+      !fs.existsSync(path.join(dir, 'node_modules'))      ||
+      !fs.existsSync(path.join(dir, 'build', 'index.js'))
+    ) return false;
     try {
-      const saved  = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
-      const current = this.getBuildKey(worktreeDir);
+      const saved   = JSON.parse(fs.readFileSync(path.join(dir, this.STATE_FILE), 'utf-8'));
+      const current = this.getBuildKey(dir);
       if (!current) return false;
       return saved.commit === current.commit && saved.dirty === current.dirty;
     } catch { return false; }
   }
 
-  private writeBuildCache(worktreeDir: string): void {
+  private writeBuildCache(dir: string): void {
     try {
-      const key = this.getBuildKey(worktreeDir);
-      if (key) {
-        fs.writeFileSync(path.join(worktreeDir, this.STATE_FILE), JSON.stringify(key));
-      }
+      const key = this.getBuildKey(dir);
+      if (key) fs.writeFileSync(path.join(dir, this.STATE_FILE), JSON.stringify(key));
     } catch { /* non-fatal */ }
   }
 
-  /** Human-readable description of why a repo needs a rebuild. */
-  private buildCacheStatus(worktreeDir: string): string {
-    const stateFile = path.join(worktreeDir, this.STATE_FILE);
-    if (!fs.existsSync(path.join(worktreeDir, 'build', 'index.js'))) return 'no build output';
-    if (!fs.existsSync(stateFile)) return 'no cache stamp';
+  private buildCacheStatus(dir: string): string {
+    if (!fs.existsSync(path.join(dir, 'build', 'index.js'))) return 'no build output';
+    if (!fs.existsSync(path.join(dir, this.STATE_FILE)))     return 'no cache stamp';
     try {
-      const saved   = JSON.parse(fs.readFileSync(stateFile, 'utf-8'));
-      const current = this.getBuildKey(worktreeDir);
+      const saved   = JSON.parse(fs.readFileSync(path.join(dir, this.STATE_FILE), 'utf-8'));
+      const current = this.getBuildKey(dir);
       if (!current) return 'git error';
-      if (saved.commit !== current.commit) return `HEAD changed (${saved.commit.slice(0,7)} → ${current.commit.slice(0,7)})`;
-      if (saved.dirty  !== current.dirty)  return 'source files changed (uncommitted)';
+      if (saved.commit !== current.commit)
+        return `HEAD changed (${saved.commit.slice(0, 7)} → ${current.commit.slice(0, 7)})`;
+      if (saved.dirty !== current.dirty) return 'source files changed (uncommitted)';
       return 'up-to-date';
     } catch { return 'state file unreadable'; }
   }
 
-  // ─── Warm-start detection ───────────────────────────────────────────────────
+  // ─── Warm-start detection ─────────────────────────────────────────────────
 
   private async detectWarmStart(): Promise<void> {
     console.log('\n📊 Startup Analysis:');
 
-    // ── Step 1: health checks ──
-    const urls = (Object.values(config.services) as any[])
-      .flatMap((s: any) => s.instances)
-      .map((i: any) => i.healthCheck)
+    const healthUrls = Object.values(composeServices)
+      .map(s => healthCheckUrl(s))
       .filter(Boolean) as string[];
 
     let servicesHealthy = false;
-    if (urls.length > 0) {
+    if (healthUrls.length > 0) {
       try {
-        await Promise.all(urls.map(url => axios.get(url, { timeout: 1500 })));
+        await Promise.all(healthUrls.map(url => axios.get(url, { timeout: 1500 })));
         servicesHealthy = true;
-        console.log(`   Services:  ✅ all ${urls.length} health checks passed`);
+        console.log(`   Services:  ✅ all ${healthUrls.length} health checks passed`);
       } catch {
-        console.log(`   Services:  ❌ one or more health checks failed → full startup required`);
+        console.log('   Services:  ❌ one or more health checks failed → full startup required');
       }
     } else {
       console.log('   Services:  ⚠️  no health checks configured');
     }
 
-    // ── Step 2: build cache ──
+    // One build-cache check per repo (multiple services can share a repo)
+    const checkedRepos = new Set<string>();
     let allCached = true;
-    for (const [service, data] of Object.entries(config.services)) {
-      if (!data.instances?.length) continue;
-      const svcDir = path.join(this.worktreeBase, service);
+    for (const svc of Object.values(composeServices)) {
+      const repo = svc['x-repo'];
+      if (checkedRepos.has(repo)) continue;
+      checkedRepos.add(repo);
+      const svcDir = path.join(this.worktreeBase, repo);
       if (!fs.existsSync(path.join(svcDir, '.git'))) continue;
-
       const status = this.buildCacheStatus(svcDir);
       const cached = status === 'up-to-date';
       if (!cached) allCached = false;
-      console.log(`   ${service.padEnd(24)} ${cached ? '⚡ cached' : `🔄 ${status}`}`);
+      console.log(`   ${repo.padEnd(24)} ${cached ? '⚡ cached' : `🔄 ${status}`}`);
     }
 
     this._warmStart = servicesHealthy && allCached;
 
-    const v = this.verbose;
-    const verboseNote = v === true ? '(verbose=true: service logs → terminal+log)' :
-                        v === 'errors' ? '(verbose="errors": stderr→terminal, stdout→log)' :
-                        '(verbose=false: service logs → log file only)';
+    const v    = this.verbose;
+    const note = v === true     ? '(verbose=true: service logs → terminal+log)'     :
+                 v === 'errors' ? '(verbose="errors": stderr→terminal, stdout→log)' :
+                                  '(verbose=false: service logs → log file only)';
     if (this._warmStart) {
-      console.log(`\n⚡ Mode: WARM START — skipping docker / migrations / build / restart. Going straight to tests. ${verboseNote}\n`);
+      console.log(`\n⚡ Mode: WARM START — skipping docker / migrations / build / restart. ${note}\n`);
     } else {
-      const reasons: string[] = [];
-      if (!servicesHealthy) reasons.push('services not healthy');
-      if (!allCached)       reasons.push('code changed');
-      console.log(`\n🚀 Mode: COLD START — reason: ${reasons.join(', ')}. Running full setup. ${verboseNote}\n`);
+      const reasons = [
+        ...(!servicesHealthy ? ['services not healthy'] : []),
+        ...(!allCached       ? ['code changed']         : []),
+      ];
+      console.log(`\n🚀 Mode: COLD START — reason: ${reasons.join(', ')}. ${note}\n`);
     }
   }
 
-  // ─── Compose override (bridge network support) ──────────────────────────────
+  // ─── Compose override (bridge network) ───────────────────────────────────
 
   private writeComposeOverride(
     dir: string,
     networkName: string,
-    serviceEnvOverrides: Record<string, Record<string, string>>,
+    svcEnvOverrides: Record<string, Record<string, string>>,
   ): void {
-    const composeContent = fs.readFileSync(path.join(dir, 'docker-compose.yml'), 'utf-8');
-    const serviceNames = [...composeContent.matchAll(/^  (\w[\w-]+):\s*$/gm)].map(m => m[1]);
-
-    const serviceBlocks = serviceNames.map(name => {
-      const envLines = Object.entries(serviceEnvOverrides[name] || {})
+    const content  = fs.readFileSync(path.join(dir, 'docker-compose.yml'), 'utf-8');
+    const svcNames = [...content.matchAll(/^  (\w[\w-]+):\s*$/gm)].map(m => m[1]);
+    const blocks   = svcNames.map(name => {
+      const envLines = Object.entries(svcEnvOverrides[name] || {})
         .filter(([k]) => !k.startsWith('_'))
         .map(([k, v]) => `      - ${k}=${v}`)
         .join('\n');
       const envBlock = envLines ? `    environment:\n${envLines}\n` : '';
       return `  ${name}:\n${envBlock}    networks:\n      - ${networkName}:\n`;
     }).join('\n');
-
-    const override = [
-      'services:',
-      serviceBlocks,
-      'networks:',
-      `  ${networkName}:`,
-      '    external: true',
-    ].join('\n');
-
-    fs.writeFileSync(path.join(dir, 'docker-compose.override.yml'), override);
+    fs.writeFileSync(path.join(dir, 'docker-compose.override.yml'), [
+      'services:', blocks, 'networks:', `  ${networkName}:`, '    external: true',
+    ].join('\n'));
   }
 
-  // ─── Internals ──────────────────────────────────────────────────────────────
+  // ─── Internals ────────────────────────────────────────────────────────────
 
   private runAsync(cmd: string, cwd: string, env: any = process.env): Promise<void> {
     return new Promise((resolve, reject) => {
@@ -243,32 +283,74 @@ export class E2EOrchestrator {
     });
   }
 
-  private buildEnvironment(
-    worktreeDir: string,
-    envBaseFile: string,
-    overrides: Record<string, string>,
-    index: number,
-  ) {
-    const envPath = path.join(worktreeDir, envBaseFile);
-    let baseEnv: Record<string, string> = {};
+  /**
+   * Builds the final process environment for a service.
+   * Merge order (later wins): process.env → x-env-file → environment → x-bridge-env (if network)
+   */
+  private buildEnvironment(worktreeDir: string, svc: ComposeService): Record<string, string> {
+    const envPath = path.join(worktreeDir, svc['x-env-file']);
+    const fileEnv: Record<string, string> = {};
     if (fs.existsSync(envPath)) {
-      const rawEnv = fs.readFileSync(envPath, 'utf-8');
-      rawEnv.split('\n').forEach((line: string) => {
-        const trimmed = line.trim();
-        if (trimmed && !trimmed.startsWith('#')) {
-          const [key, ...val] = trimmed.split('=');
-          baseEnv[key] = val.join('=');
+      fs.readFileSync(envPath, 'utf-8').split('\n').forEach(line => {
+        const t = line.trim();
+        if (t && !t.startsWith('#')) {
+          const [key, ...val] = t.split('=');
+          if (key) fileEnv[key] = val.join('=');
         }
       });
     }
-    const finalEnv = { ...process.env, ...baseEnv, npm_config_cache: this.npmCacheDir };
-    for (const [key, value] of Object.entries(overrides)) {
-      finalEnv[key] = String(value).replace(/{INDEX}/g, index.toString());
-    }
-    return finalEnv;
+    const bridgeEnv = this.network ? (svc['x-bridge-env'] ?? {}) : {};
+    return {
+      ...(process.env as Record<string, string>),
+      ...fileEnv,
+      ...parseEnv(svc.environment),
+      ...bridgeEnv,
+      npm_config_cache: this.npmCacheDir,
+    };
   }
 
-  // ─── Public API ─────────────────────────────────────────────────────────────
+  // ─── Endpoint export ──────────────────────────────────────────────────────
+
+  private exportEndpoints(): void {
+    const endpoints: Record<string, string> = {};
+    const postmanValues: { key: string; value: string; type: string; enabled: boolean }[] = [];
+    const rows: string[] = [];
+
+    for (const [name, svc] of Object.entries(composeServices)) {
+      const port = hostPort(svc.ports);
+      if (!port) continue;
+      const url = `http://127.0.0.1:${port}`;
+      endpoints[name] = url;
+      rows.push(`  ${name.padEnd(22)} →  ${url}`);
+      postmanValues.push({
+        key: name.toUpperCase().replace(/-/g, '_') + '_URL',
+        value: url,
+        type: 'default',
+        enabled: true,
+      });
+    }
+
+    const sep = '─'.repeat(52);
+    console.log(`\n┌${sep}┐`);
+    console.log(`│  Active Service Endpoints${' '.repeat(sep.length - 26)}│`);
+    console.log(`├${sep}┤`);
+    rows.forEach(r => console.log(`│${r.padEnd(sep.length + 1)}│`));
+    console.log(`└${sep}┘\n`);
+
+    // Consumed by tests/utils/config.ts as a fast lookup after first run
+    fs.writeFileSync('./.e2e-endpoints.json', JSON.stringify(endpoints, null, 2));
+
+    // Drag-and-drop into Postman for manual API testing
+    fs.writeFileSync('./E2E_Local.postman_environment.json', JSON.stringify({
+      id: 'e2e-local-dev',
+      name: 'E2E Local Environment',
+      values: postmanValues,
+      _postman_variable_scope: 'environment',
+    }, null, 2));
+    console.log('📦 Postman env → E2E_Local.postman_environment.json');
+  }
+
+  // ─── Public API ───────────────────────────────────────────────────────────
 
   async setupWorktrees() {
     if (this.skipPull) {
@@ -277,69 +359,59 @@ export class E2EOrchestrator {
       if (!fs.existsSync(this.worktreeBase)) {
         fs.mkdirSync(this.worktreeBase, { recursive: true });
       }
-
       console.log('🌳 Provisioning Git Worktrees (Concurrently)...');
-      const tasks = Object.entries(config.services).map(async ([service, data]) => {
-        const targetDir = path.join(this.worktreeBase, service);
-        const repoPath  = path.resolve(data.repoPath);
-
+      await Promise.all(Object.entries(orchestratorCfg.repos).map(async ([repoName, repo]) => {
+        const targetDir = path.join(this.worktreeBase, repoName);
+        const repoPath  = path.resolve(repo.repoPath);
         if (fs.existsSync(path.join(targetDir, '.git'))) {
-          console.log(`   -> Pulling latest for ${service} @ ${data.target}...`);
-          // No docker-compose down here — services stay running until cold start is confirmed.
+          console.log(`   -> Pulling latest for ${repoName} @ ${repo.target}...`);
           await this.runAsync('git reset --hard HEAD', targetDir);
-          await this.runAsync(`git pull origin ${data.target}`, targetDir);
+          await this.runAsync(`git pull origin ${repo.target}`, targetDir);
         } else {
-          console.log(`   -> Cloning ${service} @ ${data.target}...`);
+          console.log(`   -> Cloning ${repoName} @ ${repo.target}...`);
           if (fs.existsSync(targetDir)) fs.rmSync(targetDir, { recursive: true, force: true });
           await this.runAsync('git fetch --all', repoPath);
-          try { await this.runAsync('git worktree prune', repoPath); } catch (e) {}
-          await this.runAsync(`git worktree add -f ${targetDir} ${data.target}`, repoPath);
+          try { await this.runAsync('git worktree prune', repoPath); } catch {}
+          await this.runAsync(`git worktree add -f ${targetDir} ${repo.target}`, repoPath);
         }
-      });
-      await Promise.all(tasks);
+      }));
     }
 
-    // Detect warm start AFTER git pull so HEAD reflects latest remote state.
     await this.detectWarmStart();
 
-    // Kill stale node/bun processes on service ports only when a cold start is needed.
-    // On warm start we leave them alone — they ARE the services we want to reuse.
     if (!this._warmStart) {
       const ports = this.portsToClear;
       console.log(`🧹 Cold start: clearing stale processes on ports [${ports.join(', ')}]`);
       for (const port of ports) {
         try {
-          execSync(
-            `lsof -i:${port} | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`,
-          );
-        } catch (e) {}
+          execSync(`lsof -i:${port} | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`);
+        } catch {}
       }
     }
   }
 
   async startInfrastructure() {
-    // 👇 Make sure Docker is alive before doing anything with Compose
     this.ensureDockerRunning();
-
     if (this._warmStart) {
       console.log('⚡ Warm start: skipping Docker infrastructure startup.');
       return;
     }
 
     console.log('🐳 Starting Infrastructure (Docker Compose)...');
-    const infraServices = ['queue-service', 'remote-game-server'];
+    const infraRepos = ['queue-service', 'remote-game-server'];
 
     if (this.network) {
       console.log(`   -> Creating Docker network '${this.network}'...`);
       execSync(`docker network create ${this.network} 2>/dev/null || true`);
     }
 
-    await Promise.all(infraServices.map(async (service) => {
-      const dir         = path.join(this.worktreeBase, service);
+    await Promise.all(infraRepos.map(async repoName => {
+      const dir         = path.join(this.worktreeBase, repoName);
       const composeFile = path.join(dir, 'docker-compose.yml');
       if (!fs.existsSync(composeFile)) return;
 
-      console.log(`   -> Bringing up ${service} infra...`);
+      console.log(`   -> Bringing up ${repoName} infra...`);
+      // Remap RustFS ports 7000/7001 → 7002/7003 to avoid AirPlay conflict on macOS
       let content = fs.readFileSync(composeFile, 'utf-8');
       content = content
         .replace(/'7000:9000'/g, "'7002:9000'").replace(/"7000:9000"/g, '"7002:9000"')
@@ -347,10 +419,9 @@ export class E2EOrchestrator {
       fs.writeFileSync(composeFile, content);
 
       if (this.network) {
-        const svcData = (config.services as any)[service];
-        this.writeComposeOverride(dir, this.network, svcData?.composeServiceEnvOverrides ?? {});
+        const overrides = orchestratorCfg.composeServiceEnvOverrides?.[repoName] ?? {};
+        this.writeComposeOverride(dir, this.network, overrides);
       }
-
       await this.runAsync('docker compose up -d', dir);
     }));
 
@@ -363,38 +434,31 @@ export class E2EOrchestrator {
       console.log('⚡ Warm start: skipping migrations.');
       return;
     }
+    console.log('🗄️  Running DB Migrations...');
 
-    console.log('🗄️ Running DB Migrations...');
-    for (const [service, data] of Object.entries(config.services)) {
-      const worktreeDir   = path.join(this.worktreeBase, service);
+    // Run migrations once per repo (multiple services may share a repo)
+    const reposMigrated = new Set<string>();
+    for (const svc of Object.values(composeServices)) {
+      const repo = svc['x-repo'];
+      if (reposMigrated.has(repo)) continue;
+      const worktreeDir   = path.join(this.worktreeBase, repo);
       const migrationsDir = path.join(worktreeDir, 'db-migrations');
       if (!fs.existsSync(migrationsDir)) continue;
+      reposMigrated.add(repo);
 
-      let migrationEnv = process.env;
-      const firstInstance = data.instances?.[0];
-      if (firstInstance) {
-        migrationEnv = this.buildEnvironment(
-          worktreeDir,
-          firstInstance.envBase,
-          firstInstance.envOverrides as Record<string, string> || {},
-          1,
-        ) as any;
-        const baseEnvPath = path.join(worktreeDir, firstInstance.envBase);
-        const destEnvPath = path.join(worktreeDir, '.env');
-        if (fs.existsSync(baseEnvPath)) {
-          fs.copyFileSync(baseEnvPath, destEnvPath);
-          if (firstInstance.envOverrides) {
-            const overrides = Object.entries(firstInstance.envOverrides)
-              .map(([k, v]) => `${k}=${String(v).replace(/{INDEX}/g, '1')}`);
-            fs.appendFileSync(destEnvPath, '\n' + overrides.join('\n') + '\n');
-          }
-        }
+      const migrationEnv = this.buildEnvironment(worktreeDir, svc);
+      const baseEnvPath  = path.join(worktreeDir, svc['x-env-file']);
+      const destEnvPath  = path.join(worktreeDir, '.env');
+      if (fs.existsSync(baseEnvPath)) {
+        fs.copyFileSync(baseEnvPath, destEnvPath);
+        const lines = Object.entries(parseEnv(svc.environment)).map(([k, v]) => `${k}=${v}`);
+        if (lines.length) fs.appendFileSync(destEnvPath, '\n' + lines.join('\n') + '\n');
       }
 
       const dbs = fs.readdirSync(migrationsDir)
-        .filter((f: string) => fs.statSync(path.join(migrationsDir, f)).isDirectory());
+        .filter(f => fs.statSync(path.join(migrationsDir, f)).isDirectory());
       for (const db of dbs) {
-        console.log(`   -> Migrating ${service} -> ${db}`);
+        console.log(`   -> Migrating ${repo} -> ${db}`);
         const proc = Bun.spawnSync(
           ['npx', '--yes', '@ikigaians/migrate@2.0.1-alpha.6', 'up', db],
           { cwd: worktreeDir, stdout: 'inherit', env: migrationEnv as any },
@@ -407,161 +471,168 @@ export class E2EOrchestrator {
   async runServices() {
     if (this._warmStart) {
       console.log('⚡ Warm start: all services already running with current code.');
+      this.exportEndpoints();
       return;
     }
 
     console.log('🚀 Preparing Dependencies & Builds (Concurrently)...');
 
+    // ── Phase 1: build (once per repo, git-hash cached) ──────────────────────
+
     const buildTasks: Promise<void>[] = [];
-    const executionTasks: any[]       = [];
-    const healthChecksToAwait: string[] = [];
-    const preparedWorktrees = new Set<string>();
+    const builtRepos = new Set<string>();
 
-    for (const [service, data] of Object.entries(config.services)) {
-      const worktreeDir = path.join(this.worktreeBase, service);
+    for (const svc of Object.values(composeServices)) {
+      const repo        = svc['x-repo'];
+      const setupCmds   = svc['x-setup'] ?? [];
+      const worktreeDir = path.join(this.worktreeBase, repo);
+      if (!setupCmds.length || builtRepos.has(repo)) continue;
+      builtRepos.add(repo);
 
-      for (const instance of data.instances) {
-        const count = instance.count || 1;
-        for (let i = 1; i <= count; i++) {
-          const instanceName = count > 1 ? `${instance.name}-${i}` : instance.name;
-
-          // Merge networkEnvOverrides on top of envOverrides when bridge network is active
-          const allOverrides = {
-            ...(instance.envOverrides || {}),
-            ...(this.network ? (instance as any).networkEnvOverrides || {} : {}),
-          } as Record<string, string>;
-          const mergedEnv = this.buildEnvironment(worktreeDir, instance.envBase, allOverrides, i);
-
-          if (instance.healthCheck) {
-            healthChecksToAwait.push(instance.healthCheck.replace(/{INDEX}/g, i.toString()));
-          }
-
-          const syncCmds  = (instance.commands as CommandDef[]).filter(c => c.sync);
-          const asyncCmds = (instance.commands as CommandDef[]).filter(c => !c.sync);
-
-          if (syncCmds.length > 0 && !preparedWorktrees.has(worktreeDir)) {
-            preparedWorktrees.add(worktreeDir);
-            buildTasks.push((async () => {
-              if (this.isBuildCached(worktreeDir)) {
-                console.log(`   [CACHE HIT] ${service}: skipping install & build (HEAD unchanged)`);
-                return;
-              }
-              for (const cmd of syncCmds) {
-                console.log(`   [BUILD] ${service}: ${cmd.run}`);
-                const proc = Bun.spawn(['sh', '-c', cmd.run], { cwd: worktreeDir, env: mergedEnv as any });
-                await proc.exited;
-                if (proc.exitCode !== 0) {
-                  const err = await new Response(proc.stderr).text();
-                  throw new Error(`Build failed for ${service}: ${err}`);
-                }
-              }
-              this.writeBuildCache(worktreeDir);
-            })());
-          }
-          executionTasks.push({ instanceName, worktreeDir, mergedEnv, asyncCmds });
+      buildTasks.push((async () => {
+        if (this.isBuildCached(worktreeDir)) {
+          console.log(`   [CACHE HIT] ${repo}: skipping install & build`);
+          return;
         }
-      }
+        const mergedEnv = this.buildEnvironment(worktreeDir, svc);
+        for (const cmd of setupCmds) {
+          console.log(`   [BUILD] ${repo}: ${cmd}`);
+          const proc = Bun.spawn(['sh', '-c', cmd], { cwd: worktreeDir, env: mergedEnv as any });
+          await proc.exited;
+          if (proc.exitCode !== 0) {
+            const err = await new Response(proc.stderr).text();
+            throw new Error(`Build failed for ${repo}: ${err}`);
+          }
+        }
+        this.writeBuildCache(worktreeDir);
+      })());
     }
 
     await Promise.all(buildTasks);
 
+    // ── Phase 2: start services, honouring depends_on ─────────────────────────
+    //
+    // Each service gets a "ready" promise that resolves once its healthcheck passes
+    // (or immediately if no healthcheck). Dependents await their deps' ready promises
+    // before spawning — replacing `while ! curl` bash hacks with native logic.
+
     console.log('\n🚀 Starting Node Servers...');
-    for (const task of executionTasks) {
-      for (const cmd of task.asyncCmds) {
-        console.log(`   [START] ${task.instanceName}: ${cmd.run}`);
-        const verboseMode = this.verbose;       // false | true | "errors"
-        const logStream   = this.openServiceLogStream();
-        const dec         = new TextDecoder();
-        const name        = task.instanceName;
+    const verboseMode  = this.verbose;
+    const masterStream = this.ensureMasterStream();
 
-        const proc = Bun.spawn(['sh', '-c', cmd.run], {
-          cwd: task.worktreeDir,
-          env: task.mergedEnv as any,
-          stdout: 'pipe',   // always pipe so we can write to log file
-          stderr: 'pipe',
-        });
-
-        // stdout: to log always; to terminal only when verbose=true
-        proc.stdout?.pipeTo(new WritableStream({
-          write: chunk => {
-            const line = `[${name}] ${dec.decode(chunk)}`;
-            logStream?.write(line);
-            if (verboseMode === true) process.stdout.write(line);
-          },
-        }));
-
-        // stderr: to log always; to terminal when verbose=true OR verbose="errors"
-        proc.stderr?.pipeTo(new WritableStream({
-          write: chunk => {
-            const line = `[${name} ERROR] ${dec.decode(chunk)}`;
-            logStream?.write(line);
-            if (verboseMode === true || verboseMode === 'errors') process.stderr.write(line);
-          },
-        }));
-
-        this.activeProcesses.push(proc);
-      }
+    // Register all ready promises upfront so deps can reference them immediately
+    const readyMap = new Map<string, { resolve: () => void; promise: Promise<void> }>();
+    for (const name of Object.keys(composeServices)) {
+      let resolve!: () => void;
+      readyMap.set(name, { resolve, promise: new Promise<void>(r => { resolve = r; }) });
     }
 
-    await this.waitForHealthChecks(healthChecksToAwait);
-  }
+    // Track actual health-check failures separately from dep-coordination
+    const healthCheckResults: Promise<void>[] = [];
 
-  private async waitForHealthChecks(urls: string[]) {
-    if (urls.length === 0) return;
-    console.log(`\n⏳ Waiting for ${urls.length} health checks (parallel)...`);
-    await Promise.all(urls.map(async (url) => {
-      for (let attempt = 1; attempt <= 60; attempt++) {
-        try {
-          await axios.get(url, { timeout: 2000 });
-          console.log(`   ✅ Ready: ${url}`);
-          return;
-        } catch {
-          await new Promise(r => setTimeout(r, 1000));
+    const launchTasks = Object.entries(composeServices).map(([name, svc]) => (async () => {
+      // Await declared dependencies before starting
+      const deps = dependsOn(svc);
+      if (deps.length > 0) {
+        const depPromises = deps.map(d => readyMap.get(d)?.promise).filter(Boolean) as Promise<void>[];
+        if (depPromises.length) {
+          console.log(`   [WAIT]  ${name}: waiting for [${deps.join(', ')}]...`);
+          await Promise.all(depPromises);
+          console.log(`   [READY] ${name}: dependencies healthy — starting`);
         }
       }
-      throw new Error(`❌ Healthcheck failed after 60 attempts: ${url}`);
-    }));
+
+      const worktreeDir   = path.join(this.worktreeBase, svc['x-repo']);
+      const port          = hostPort(svc.ports) ?? 0;
+      const hcUrl         = healthCheckUrl(svc);
+      const mergedEnv     = this.buildEnvironment(worktreeDir, svc);
+      const serviceStream = this.openServiceStream(name, port);
+      const dec           = new TextDecoder();
+
+      console.log(`   [START] ${name}: ${svc.command}`);
+      const proc = Bun.spawn(['sh', '-c', svc.command], {
+        cwd: worktreeDir,
+        env: mergedEnv as any,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+
+      // stdout → per-service log (raw) + master log (prefixed) + terminal if verbose=true
+      proc.stdout?.pipeTo(new WritableStream({
+        write: chunk => {
+          const text = dec.decode(chunk);
+          serviceStream?.write(text);
+          masterStream?.write(`[${name}] ${text}`);
+          if (verboseMode === true) process.stdout.write(`[${name}] ${text}`);
+        },
+      }));
+
+      // stderr → per-service log (raw) + master log (prefixed) + terminal if verbose or "errors"
+      proc.stderr?.pipeTo(new WritableStream({
+        write: chunk => {
+          const text = dec.decode(chunk);
+          serviceStream?.write(text);
+          masterStream?.write(`[${name} ERR] ${text}`);
+          if (verboseMode === true || verboseMode === 'errors') process.stderr.write(`[${name} ERR] ${text}`);
+        },
+      }));
+
+      this.activeProcesses.push(proc);
+
+      if (hcUrl) {
+        const hcPromise = this.pollHealthCheck(name, hcUrl);
+        healthCheckResults.push(hcPromise);
+        hcPromise
+          .then(() => readyMap.get(name)!.resolve())
+          .catch(() => readyMap.get(name)!.resolve()); // unblock dependents even on timeout
+      } else {
+        readyMap.get(name)!.resolve();
+      }
+    })());
+
+    // Wait for all launch tasks (dep-wait + start + health-check)
+    await Promise.all(launchTasks);
+    // Surface any health-check failures
+    await Promise.all(healthCheckResults);
+
+    console.log('\n✅ All services started.\n');
+    this.exportEndpoints();
+  }
+
+  private async pollHealthCheck(name: string, url: string): Promise<void> {
+    for (let attempt = 1; attempt <= 60; attempt++) {
+      try {
+        await axios.get(url, { timeout: 2000 });
+        console.log(`   ✅ Ready: ${name} (${url})`);
+        return;
+      } catch {
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+    throw new Error(`❌ Healthcheck failed after 60 attempts: ${name} (${url})`);
   }
 
   async teardown() {
-    // Services are LEFT RUNNING by default (cleanOnTeardown: false in e2e-config.json).
-    // This makes the next `bun test` run a warm start in ~5s.
-    //
-    // To force a full stop:
-    //   • one-off:  E2E_TEARDOWN=1 bun test
-    //   • permanent: set "cleanOnTeardown": true in e2e-config.json
     const forceTeardown = process.env.E2E_TEARDOWN === '1';
-    if (!config.global.cleanOnTeardown && !forceTeardown) {
+    if (!orchestratorCfg.global.cleanOnTeardown && !forceTeardown) {
       console.log('\n⚡ Services left running. Next bun test will warm-start in ~5s.');
-      console.log('   (Force stop: E2E_TEARDOWN=1 bun test  or  "cleanOnTeardown": true in e2e-config.json)');
+      console.log('   (Force stop: E2E_TEARDOWN=1 bun test  or  cleanOnTeardown: true in e2e-orchestrator.yml)');
       return;
     }
 
     console.log('\n🛑 Tearing down E2E Environment...');
-    this.activeProcesses.forEach(proc => {
-      try { proc.kill('SIGKILL'); } catch (e) {}
-    });
-
-    const ports = this.portsToClear;
-    for (const port of ports) {
-      try {
-        execSync(`lsof -i:${port} | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`);
-      } catch (e) {}
+    this.activeProcesses.forEach(proc => { try { proc.kill('SIGKILL'); } catch {} });
+    for (const port of this.portsToClear) {
+      try { execSync(`lsof -i:${port} | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`); } catch {}
     }
 
     if (fs.existsSync(this.worktreeBase)) {
-      for (const [service, data] of Object.entries(config.services)) {
-        const dir = path.join(this.worktreeBase, service);
+      for (const [repoName, repo] of Object.entries(orchestratorCfg.repos)) {
+        const dir = path.join(this.worktreeBase, repoName);
         if (fs.existsSync(path.join(dir, 'docker-compose.yml'))) {
-          try {
-            Bun.spawnSync(['docker', 'compose', 'down', '-v', '--remove-orphans'], { cwd: dir });
-          } catch (e) {}
+          try { Bun.spawnSync(['docker', 'compose', 'down', '-v', '--remove-orphans'], { cwd: dir }); } catch {}
         }
-        try {
-          Bun.spawnSync(['git', 'worktree', 'remove', '-f', dir], {
-            cwd: path.resolve(data.repoPath),
-          });
-        } catch (e) {}
+        try { Bun.spawnSync(['git', 'worktree', 'remove', '-f', dir], { cwd: path.resolve(repo.repoPath) }); } catch {}
       }
       fs.rmSync(this.worktreeBase, { recursive: true, force: true });
     }
@@ -569,29 +640,20 @@ export class E2EOrchestrator {
 
   private ensureDockerRunning() {
     try {
-      // Check if daemon responds
       execSync('docker info', { stdio: 'ignore' });
     } catch {
       console.log('🐳 Docker daemon is down. Attempting to auto-start Docker Desktop...');
       if (process.platform === 'darwin') {
-        // macOS command to launch the Docker Desktop app
         execSync('open -a Docker');
-        console.log('⏳ Waiting for Docker VM to boot (this may take up to 30 seconds)...');
-        
+        console.log('⏳ Waiting for Docker VM to boot (up to 40s)...');
         let ready = false;
         for (let i = 0; i < 40; i++) {
-          try {
-            execSync('docker info', { stdio: 'ignore' });
-            ready = true;
-            console.log('✅ Docker daemon is now online!');
-            break;
-          } catch {}
-          execSync('sleep 1'); // wait 1s before polling again
+          try { execSync('docker info', { stdio: 'ignore' }); ready = true; console.log('✅ Docker daemon online!'); break; }
+          catch { execSync('sleep 1'); }
         }
-        
         if (!ready) throw new Error('Timeout: Docker daemon failed to start.');
       } else {
-        throw new Error('Docker daemon is not running. Auto-start is only supported on macOS.');
+        throw new Error('Docker daemon is not running. Auto-start only supported on macOS.');
       }
     }
   }

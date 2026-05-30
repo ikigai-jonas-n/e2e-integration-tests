@@ -1,5 +1,22 @@
 import { BILLING, SVC_SIG } from './config';
 
+/**
+ * Polls conditionFn every intervalMs until it returns true or maxMs elapses.
+ * Use instead of hardcoded `for (let i = 0; i < 65; i++) { sleep(1000) }` loops.
+ */
+export async function waitForCondition(
+  conditionFn: () => Promise<boolean>,
+  maxMs = 65000,
+  intervalMs = 1000,
+): Promise<void> {
+  const deadline = Date.now() + maxMs;
+  while (Date.now() < deadline) {
+    if (await conditionFn()) return;
+    await Bun.sleep(intervalMs);
+  }
+  throw new Error(`Condition not met within ${maxMs}ms`);
+}
+
 /** Max chars printed per log call — prevents huge API responses (e.g. betLevels) from flooding logs. */
 const LOG_LIMIT = 300;
 
@@ -88,6 +105,7 @@ export const api = {
   /**
    * Ensures a game is back to a "White Paper" clean state.
    */
+
   resetGameState: async (gameCode: string, amToken: string) => {
     // Force Enablement
     await api.patch(`${BILLING}/v1/internal/games/status`, {

@@ -1,0 +1,49 @@
+# E2E Orchestrator configuration
+# Defines how the test harness provisions, builds, and manages services.
+# Service runtime config (command, ports, env, depends_on) lives in docker-compose.services.yml.
+
+global:
+  # Where git worktrees for each repo are checked out
+  worktreeBasePath: "./.e2e-worktrees"
+
+  # Keep services running after bun test finishes.
+  # Next run detects healthy services + unchanged code → warm start (~5s total).
+  # Set to true or pass E2E_TEARDOWN=1 to force full teardown after a run.
+  cleanOnTeardown: false
+
+  # Service log verbosity in the terminal:
+  #   false    — service logs go to log files only (default, clean terminal)
+  #   "errors" — service stderr also printed to terminal (shows crashes)
+  #   true     — all service stdout+stderr printed to terminal
+  verbose: false
+
+  # Docker network mode for Node services:
+  #   null      — host networking (default, simplest, recommended for local dev)
+  #   "e2e-net" — bridge mode (services talk via container names instead of 127.0.0.1)
+  #               NOTE: bridge mode has a known Redis cluster issue; see HANDOVER.md
+  network: null
+
+# Git repos to check out as worktrees before starting services.
+# The orchestrator pulls each repo and caches the build by HEAD+dirty hash.
+repos:
+  queue-service:
+    repoPath: "../queue-service"
+    target: "main"
+  slot-game-server:
+    repoPath: "../slot-game-server"
+    target: "main"
+  remote-game-server:
+    repoPath: "../remote-game-server"
+    target: "main"
+
+# Per docker-compose-container env overrides applied when global.network is set.
+# These patch the advertised listeners in the infra containers for bridge networking.
+composeServiceEnvOverrides:
+  queue-service:
+    kafka-region:
+      KAFKA_CFG_ADVERTISED_LISTENERS: "INTERNAL://kafka-region:9092,EXTERNAL://kafka-region:9093,CONTROLLER://kafka-region:9094"
+    kafka-global:
+      KAFKA_CFG_ADVERTISED_LISTENERS: "INTERNAL://kafka-global:9092,EXTERNAL://kafka-global:9193,CONTROLLER://kafka-global:9094"
+  remote-game-server:
+    redis:
+      _note: "Bridge mode requires --cluster-announce-hostname redis-cluster in Redis startup"

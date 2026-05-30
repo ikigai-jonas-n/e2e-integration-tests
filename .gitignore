@@ -19,6 +19,9 @@ yarn-error.log*
 .e2e-npm-cache/
 # Build cache stamps written by orchestrator (one per worktree, commit-hash keyed)
 **/.e2e-state.json
+# Runtime outputs from orchestrator
+.e2e-endpoints.json
+E2E_Local.postman_environment.json
 
 # Bash-script artifacts
 result/
