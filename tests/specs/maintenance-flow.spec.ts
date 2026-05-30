@@ -7,7 +7,7 @@
  *   5. Verify maintenance = false
  */
 import { it, expect } from 'bun:test';
-import { api } from '../utils/api';
+import { api, logError, logWarn } from '../utils/api';
 import { BILLING, SVC_SIG } from '../utils/config';
 
 export function runMaintenanceFlowTests() {
@@ -23,7 +23,7 @@ export function runMaintenanceFlowTests() {
       permission: [{ routeKey: 'V1_INTERNAL_GAME_MAINTENANCE', methods: ['*'] }],
     }, { headers: SVC_SIG });
 
-    if (res.status !== 200) console.error('[maint/step1] AM token failed:', res.data);
+    if (res.status !== 200) logError('[maint/step1] AM token failed:', res.data);
     expect(res.status).toBe(200);
 
     // maintenance-flow.sh: .data.token
@@ -39,7 +39,7 @@ export function runMaintenanceFlowTests() {
       { headers: { 'x-access-token': amToken } },
     );
 
-    if (res.status !== 200) console.error('[maint/step2] Patch failed:', res.data);
+    if (res.status !== 200) logError('[maint/step2] Patch failed:', res.data);
     expect(res.status).toBe(200);
   });
 
@@ -62,7 +62,7 @@ export function runMaintenanceFlowTests() {
       { headers: { 'x-access-token': amToken } },
     );
 
-    if (res.status !== 200) console.error('[maint/step4] Restore failed:', res.data);
+    if (res.status !== 200) logError('[maint/step4] Restore failed:', res.data);
     expect(res.status).toBe(200);
   });
 

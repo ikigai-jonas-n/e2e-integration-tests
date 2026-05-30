@@ -8,11 +8,34 @@ Spins up all dependent services, runs tests end-to-end, and tears down cleanly.
 ## TL;DR — How To Use This
 
 ```bash
-bun install     # once, to install orchestrator deps
-bun test        # always — auto-decides what to skip
+bun install                    # once, to install orchestrator deps
+bun test                       # run everything — auto-decides what to skip
+bun test -t "Flow: Bet"        # run only the bet flow
+bun test -t "Service APIs"     # run only smoke/health checks
 ```
 
-**That's it.** No `.env` file. No flags. No manual setup.
+**That's it.** No `.env` file. No manual setup.
+
+### Services stay alive after every run
+
+By default, Docker containers and Node.js services are **never stopped** when `bun test` finishes. The next run detects them as healthy, skips all infrastructure setup, and goes straight to tests — taking ~5s instead of 2-3 minutes.
+
+```
+First run:       2-3 min  (git checkout + build + docker + migrations)
+Subsequent run:  ~5s      (git pull + warm start → straight to tests)
+```
+
+To **force a full stop** (one-off):
+```bash
+E2E_TEARDOWN=1 bun test
+```
+
+To make teardown permanent, edit `e2e-config.json`:
+```json
+{ "global": { "cleanOnTeardown": true } }
+```
+
+This is the only change needed — no code changes required.
 
 The orchestrator detects whether services are already running and whether code has changed.
 It skips everything it safely can and goes straight to tests.
@@ -76,6 +99,59 @@ No `.env` file needed. All configuration lives in `e2e-config.json`.
 
 First run takes ~2-3 minutes (git checkout + npm install + build + docker up).
 **Every subsequent run auto-detects warm state and completes in < 5 seconds** when services are already running and code hasn't changed.
+
+---
+
+## Running Specific Tests
+
+Use `--test-name-pattern` (or `-t`) to run only the tests you care about.
+The pattern matches against the full test name: `"<describe block> > <test name>"`.
+
+```bash
+# Run only smoke/health checks
+bun test -t "Service APIs"
+
+# Run only the bet + action flow
+bun test -t "Flow: Bet"
+
+# Run one specific step
+bun test -t "Step 3: Bet"
+
+# Run all lobby flow steps
+bun test -t "Flow: Lobby"
+
+# Run the bridge / Kafka propagation flow
+bun test -t "Flow: Bridge"
+
+# Run maintenance flow
+bun test -t "Flow: Game Maintenance"
+
+# Run everything that touches a session
+bun test -t "Session"
+```
+
+**How it works**: `beforeAll` (infra boot) always runs, but only matching tests execute.
+On a warm start the `beforeAll` takes ~5s, so targeting one flow is near-instant.
+
+### All test suites and their names
+
+| Suite | Pattern to use |
+|---|---|
+| Health checks + game registry | `"Service APIs"` |
+| AM token, enable/disable game | `"Internal APIs"` |
+| Individual exp endpoints | `"Experience APIs"` |
+| Full bet → action → finish lifecycle | `"Flow: Bet"` |
+| Session token activate + refresh | `"Flow: Lobby"` |
+| Maintenance toggle | `"Flow: Game Maintenance"` |
+| Kafka state propagation (bridge) | `"Flow: Bridge"` |
+
+### Tip: combine with warm start
+
+Services stay running after each `bun test` (by default). So the second time you run with a pattern, it hits warm start and the full run is:
+
+```
+git pull (~1s) → health check (~1s) → your 2-3 tests (~3s) = ~5s total
+```
 
 ---
 
@@ -161,6 +237,7 @@ The cache stamp (`.e2e-state.json`) is written per repo after a successful build
 | `worktreeBasePath` | `string` | `"./.e2e-worktrees"` | Where git worktrees are checked out |
 | `cleanOnTeardown` | `boolean` | `false` | Delete worktrees after test run |
 | `network` | `string \| null` | `null` | Docker network name for bridge mode. `null` = host networking (default) |
+| `verbose` | `false \| true \| "errors"` | `false` | Controls service log visibility. Service logs are **always written to the log file**. `false` = log file only (clean terminal). `true` = log file + terminal (full noise). `"errors"` = stderr to terminal (see crashes live), stdout to log file only (no INFO/DEBUG flood). |
 
 ### `services[name]`
 
@@ -199,17 +276,25 @@ The orchestrator pulls the specified branch into its git worktree. The build cac
 
 ---
 
-## Environment Variable Flag
+## Environment Variable Flags
 
-| Variable | Value | Effect |
-|---|---|---|
-| `E2E_SKIP_PULL=1` | set | Skip `git pull` on all repos. Use when testing **local uncommitted changes** — prevents `git reset --hard` from discarding your edits. All other smart-start logic (health checks, build cache) still applies. |
+| Variable | Effect |
+|---|---|
+| `E2E_TEARDOWN=1` | Force stop all services and Docker after the run, even when `cleanOnTeardown` is false. Use when you're done for the day and want to free resources. |
+| `E2E_SKIP_PULL=1` | Skip `git pull`. Use when testing local uncommitted changes — prevents `git reset --hard` from discarding your edits. Build cache + warm start still apply. |
 
 ```bash
+# Done for the day — shut everything down
+E2E_TEARDOWN=1 bun test
+
+# Test local changes without git pulling
 E2E_SKIP_PULL=1 bun test
+
+# Both at once
+E2E_TEARDOWN=1 E2E_SKIP_PULL=1 bun test
 ```
 
-Do **not** use this in CI. CI should always pull latest.
+`E2E_SKIP_PULL=1` — do **not** use in CI. CI must always pull latest.
 
 ---
 

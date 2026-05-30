@@ -1,6 +1,6 @@
 import { beforeAll, afterAll, describe } from 'bun:test';
 import { E2EOrchestrator } from '../src/E2EOrchestrator';
-import { api } from './utils/api';
+import { api, log } from './utils/api';
 import { BILLING, GAME, SVC_SIG } from './utils/config';
 
 // Unit-test style specs (individual endpoint coverage)
@@ -22,7 +22,7 @@ beforeAll(async () => {
   await orchestrator.runGlobalMigrations();
   await orchestrator.runServices();
 
-  console.log('[setup] Waiting for caches to warm up...');
+  log('[setup] Waiting for caches to warm up...');
   let cacheReady = false;
   for (let i = 0; i < 90; i++) {
     try {
@@ -33,20 +33,20 @@ beforeAll(async () => {
       const gGames = gRes.data?.data?.games ?? gRes.data?.data;
 
       if (Array.isArray(bGames) && bGames.length > 0 && Array.isArray(gGames) && gGames.length > 0) {
-        console.log(`[setup] Both caches ready after ~${i}s (billing: ${bGames.length}, game: ${gGames.length} games)`);
+        log(`[setup] Both caches ready after ~${i}s (billing: ${bGames.length}, game: ${gGames.length} games)`);
         cacheReady = true;
         break;
       }
       if (i > 0 && i % 15 === 0) {
         const bOk = Array.isArray(bGames) && bGames.length > 0;
         const gOk = Array.isArray(gGames) && gGames.length > 0;
-        console.log(`[setup] Still waiting... billing=${bOk ? 'ready' : 'empty'}, game=${gOk ? 'ready' : 'empty'}`);
+        log(`[setup] Still waiting... billing=${bOk ? 'ready' : 'empty'}, game=${gOk ? 'ready' : 'empty'}`);
       }
     } catch {}
     await new Promise(r => setTimeout(r, 1000));
   }
   if (!cacheReady) throw new Error('Timeout waiting for process caches (billing + game node).');
-  console.log('✅ Setup complete.');
+  log('✅ Setup complete.');
 }, 600000);
 
 afterAll(async () => {

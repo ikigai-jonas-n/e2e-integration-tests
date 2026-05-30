@@ -25,6 +25,30 @@ export class E2EOrchestrator {
    */
   private readonly skipPull = process.env.E2E_SKIP_PULL === '1';
 
+  // ─── Verbose mode ───────────────────────────────────────────────────────────
+
+  /**
+   * Controls whether service logs appear on the terminal.
+   *   false      (default) — service stdout+stderr → log file only
+   *   true                 — service stdout+stderr → log file AND terminal
+   *   "errors"             — service stderr → log file AND terminal (crash-visible);
+   *                          service stdout → log file only (no INFO/DEBUG flood)
+   *
+   * Service logs are ALWAYS written to the log file regardless of this setting.
+   */
+  private get verbose(): boolean | 'errors' {
+    const v = (config.global as any).verbose;
+    if (v === 'errors') return 'errors';
+    return v === true;
+  }
+
+  /** Returns a WriteStream appending to the log file, or null if not running via run-e2e.sh. */
+  private openServiceLogStream(): ReturnType<typeof fs.createWriteStream> | null {
+    const logFile = process.env.E2E_LOG_FILE;
+    if (!logFile) return null;
+    return fs.createWriteStream(logFile, { flags: 'a' });
+  }
+
   // ─── Network ────────────────────────────────────────────────────────────────
 
   private get network(): string | null {
@@ -160,13 +184,17 @@ export class E2EOrchestrator {
 
     this._warmStart = servicesHealthy && allCached;
 
+    const v = this.verbose;
+    const verboseNote = v === true ? '(verbose=true: service logs → terminal+log)' :
+                        v === 'errors' ? '(verbose="errors": stderr→terminal, stdout→log)' :
+                        '(verbose=false: service logs → log file only)';
     if (this._warmStart) {
-      console.log('\n⚡ Mode: WARM START — skipping docker / migrations / build / restart. Going straight to tests.\n');
+      console.log(`\n⚡ Mode: WARM START — skipping docker / migrations / build / restart. Going straight to tests. ${verboseNote}\n`);
     } else {
       const reasons: string[] = [];
       if (!servicesHealthy) reasons.push('services not healthy');
       if (!allCached)       reasons.push('code changed');
-      console.log(`\n🚀 Mode: COLD START — reason: ${reasons.join(', ')}. Running full setup.\n`);
+      console.log(`\n🚀 Mode: COLD START — reason: ${reasons.join(', ')}. Running full setup. ${verboseNote}\n`);
     }
   }
 
@@ -243,18 +271,6 @@ export class E2EOrchestrator {
   // ─── Public API ─────────────────────────────────────────────────────────────
 
   async setupWorktrees() {
-    console.log('🧹 Running Pre-flight Cleanup...');
-
-    const ports = this.portsToClear;
-    console.log(`   Clearing ports: [${ports.join(', ')}]`);
-    for (const port of ports) {
-      try {
-        execSync(
-          `lsof -i:${port} | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`,
-        );
-      } catch (e) {}
-    }
-
     if (this.skipPull) {
       console.log('⚡ E2E_SKIP_PULL=1: skipping git pull (using local working tree as-is).');
     } else {
@@ -269,9 +285,7 @@ export class E2EOrchestrator {
 
         if (fs.existsSync(path.join(targetDir, '.git'))) {
           console.log(`   -> Pulling latest for ${service} @ ${data.target}...`);
-          if (fs.existsSync(path.join(targetDir, 'docker-compose.yml'))) {
-            Bun.spawnSync(['docker', 'compose', 'down', '-v', '--remove-orphans'], { cwd: targetDir });
-          }
+          // No docker-compose down here — services stay running until cold start is confirmed.
           await this.runAsync('git reset --hard HEAD', targetDir);
           await this.runAsync(`git pull origin ${data.target}`, targetDir);
         } else {
@@ -285,11 +299,21 @@ export class E2EOrchestrator {
       await Promise.all(tasks);
     }
 
-    // Auto-detect warm start AFTER git pull so HEAD reflects latest remote state.
-    // Warm = all healthchecks pass AND no repo has changed since last successful build.
+    // Detect warm start AFTER git pull so HEAD reflects latest remote state.
     await this.detectWarmStart();
-    if (this._warmStart) {
-      console.log('⚡ Auto warm start: services healthy, code unchanged — will skip infra/migrations/restart.');
+
+    // Kill stale node/bun processes on service ports only when a cold start is needed.
+    // On warm start we leave them alone — they ARE the services we want to reuse.
+    if (!this._warmStart) {
+      const ports = this.portsToClear;
+      console.log(`🧹 Cold start: clearing stale processes on ports [${ports.join(', ')}]`);
+      for (const port of ports) {
+        try {
+          execSync(
+            `lsof -i:${port} | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`,
+          );
+        } catch (e) {}
+      }
     }
   }
 
@@ -445,16 +469,36 @@ export class E2EOrchestrator {
     for (const task of executionTasks) {
       for (const cmd of task.asyncCmds) {
         console.log(`   [START] ${task.instanceName}: ${cmd.run}`);
+        const verboseMode = this.verbose;       // false | true | "errors"
+        const logStream   = this.openServiceLogStream();
+        const dec         = new TextDecoder();
+        const name        = task.instanceName;
+
         const proc = Bun.spawn(['sh', '-c', cmd.run], {
           cwd: task.worktreeDir,
           env: task.mergedEnv as any,
+          stdout: 'pipe',   // always pipe so we can write to log file
+          stderr: 'pipe',
         });
+
+        // stdout: to log always; to terminal only when verbose=true
         proc.stdout?.pipeTo(new WritableStream({
-          write: chunk => process.stdout.write(`[${task.instanceName}] ${new TextDecoder().decode(chunk)}`),
+          write: chunk => {
+            const line = `[${name}] ${dec.decode(chunk)}`;
+            logStream?.write(line);
+            if (verboseMode === true) process.stdout.write(line);
+          },
         }));
+
+        // stderr: to log always; to terminal when verbose=true OR verbose="errors"
         proc.stderr?.pipeTo(new WritableStream({
-          write: chunk => process.stderr.write(`[${task.instanceName} ERROR] ${new TextDecoder().decode(chunk)}`),
+          write: chunk => {
+            const line = `[${name} ERROR] ${dec.decode(chunk)}`;
+            logStream?.write(line);
+            if (verboseMode === true || verboseMode === 'errors') process.stderr.write(line);
+          },
         }));
+
         this.activeProcesses.push(proc);
       }
     }
@@ -480,19 +524,28 @@ export class E2EOrchestrator {
   }
 
   async teardown() {
+    // Services are LEFT RUNNING by default (cleanOnTeardown: false in e2e-config.json).
+    // This makes the next `bun test` run a warm start in ~5s.
+    //
+    // To force a full stop:
+    //   • one-off:  E2E_TEARDOWN=1 bun test
+    //   • permanent: set "cleanOnTeardown": true in e2e-config.json
+    const forceTeardown = process.env.E2E_TEARDOWN === '1';
+    if (!config.global.cleanOnTeardown && !forceTeardown) {
+      console.log('\n⚡ Services left running. Next bun test will warm-start in ~5s.');
+      console.log('   (Force stop: E2E_TEARDOWN=1 bun test  or  "cleanOnTeardown": true in e2e-config.json)');
+      return;
+    }
+
     console.log('\n🛑 Tearing down E2E Environment...');
     this.activeProcesses.forEach(proc => {
       try { proc.kill('SIGKILL'); } catch (e) {}
     });
 
-    // ASSASSINATE ORPHANED NODE PROCESSES (Excluding ourselves)
     const ports = this.portsToClear;
-    const myPid = process.pid;
-    console.log(`   🧹 Clearing node/bun processes on ports: [${ports.join(', ')}]`);
     for (const port of ports) {
       try {
-        // STRICTLY kill only 'node' or 'bun' commands, excluding our own orchestrator PID
-        execSync(`lsof -i:${port} | grep -E 'node|bun' | awk '{print $2}' | grep -v '^${myPid}$' | sort -u | xargs kill -9 2>/dev/null || true`);
+        execSync(`lsof -i:${port} | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`);
       } catch (e) {}
     }
 
@@ -504,17 +557,13 @@ export class E2EOrchestrator {
             Bun.spawnSync(['docker', 'compose', 'down', '-v', '--remove-orphans'], { cwd: dir });
           } catch (e) {}
         }
-        if (config.global.cleanOnTeardown) {
-          try {
-            Bun.spawnSync(['git', 'worktree', 'remove', '-f', dir], {
-              cwd: path.resolve(data.repoPath),
-            });
-          } catch (e) {}
-        }
+        try {
+          Bun.spawnSync(['git', 'worktree', 'remove', '-f', dir], {
+            cwd: path.resolve(data.repoPath),
+          });
+        } catch (e) {}
       }
-      if (config.global.cleanOnTeardown) {
-        fs.rmSync(this.worktreeBase, { recursive: true, force: true });
-      }
+      fs.rmSync(this.worktreeBase, { recursive: true, force: true });
     }
   }
 

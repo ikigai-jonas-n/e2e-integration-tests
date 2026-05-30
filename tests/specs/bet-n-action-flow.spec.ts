@@ -7,7 +7,7 @@
  *   5. Finish           → only if data.results.gameResponse.step.summary.coins > 0
  */
 import { it, expect } from 'bun:test';
-import { api } from '../utils/api';
+import { api, logError, logWarn } from '../utils/api';
 import { GAME, SVC_SIG } from '../utils/config';
 
 export function runBetAndActionFlow() {
@@ -42,7 +42,7 @@ export function runBetAndActionFlow() {
       callback: 'http://localhost',
     }, { headers: SVC_SIG });
 
-    if (res.status !== 200) console.error('[bet-flow/step1] Session start failed:', res.data);
+    if (res.status !== 200) logError('[bet-flow/step1] Session start failed:', res.data);
     expect(res.status).toBe(200);
 
     // Token lives in launchUrl as ?token=... (same pattern as bet-flow.sh)
@@ -66,7 +66,7 @@ export function runBetAndActionFlow() {
       },
     });
 
-    if (res.status !== 200) console.error('[bet-flow/step2] Activate failed:', res.data);
+    if (res.status !== 200) logError('[bet-flow/step2] Activate failed:', res.data);
     expect(res.status).toBe(200);
 
     // .data.token OR .data.accessToken (matches bet-flow.sh fallback chain)
@@ -92,7 +92,7 @@ export function runBetAndActionFlow() {
       ts: Date.now(),
     }, { headers: authHeaders });
 
-    if (res.status !== 200) console.error('[bet-flow/step3] Bet failed:', JSON.stringify(res.data, null, 2));
+    if (res.status !== 200) logError('[bet-flow/step3] Bet failed:', res.data);
     expect(res.status).toBe(200);
 
     betData = res.data?.data;
@@ -120,7 +120,7 @@ export function runBetAndActionFlow() {
       session: sessionId, roundId, action, ts: Date.now(),
     }, { headers: authHeaders });
 
-    if (res.status !== 200) console.error('[bet-flow/step4] Action failed:', res.data);
+    if (res.status !== 200) logError('[bet-flow/step4] Action failed:', res.data);
     expect(res.status).toBe(200);
 
     // Update betData with action response so finish can check its coins
@@ -149,7 +149,7 @@ export function runBetAndActionFlow() {
     // 400/409 = "round is not in status for finish" — round auto-closed already
     //   (transient: stale round from prior session; resolves after ~20 min).
     if (res.status !== 200) {
-      console.warn('[bet-flow/finish] Non-200:', res.status, JSON.stringify(res.data));
+      logWarn('[bet-flow/finish] Non-200:', `${res.status}`, res.data);
     }
     expect([200, 400, 409]).toContain(res.status);
   });

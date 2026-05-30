@@ -1,5 +1,28 @@
 import { BILLING, SVC_SIG } from './config';
 
+/** Max chars printed per log call — prevents huge API responses (e.g. betLevels) from flooding logs. */
+const LOG_LIMIT = 300;
+
+function trim(data: any): string {
+  const s = typeof data === 'string' ? data : JSON.stringify(data);
+  return s.length > LOG_LIMIT ? s.slice(0, LOG_LIMIT) + '…' : s;
+}
+
+/** Truncated console.log. */
+export function log(...args: any[]): void {
+  console.log(args.map(trim).join(' '));
+}
+
+/** Truncated console.error. */
+export function logError(...args: any[]): void {
+  console.error(args.map(trim).join(' '));
+}
+
+/** Truncated console.warn. */
+export function logWarn(...args: any[]): void {
+  console.warn(args.map(trim).join(' '));
+}
+
 export const api = {
   post: async (url: string, body: any, options?: any) => {
     const res = await fetch(url, {

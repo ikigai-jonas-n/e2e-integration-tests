@@ -2,7 +2,8 @@
   "global": {
     "worktreeBasePath": "./.e2e-worktrees",
     "cleanOnTeardown": false,
-    "network": null
+    "network": null,
+    "verbose": false
   },
   "services": {
     "queue-service": {

@@ -1,5 +1,5 @@
 import { it, expect } from 'bun:test';
-import { api } from '../utils/api';
+import { api, logError, logWarn } from '../utils/api';
 import { GAME, SVC_SIG } from '../utils/config';
 
 export function runExpTests() {
@@ -55,7 +55,7 @@ export function runExpTests() {
       }
     });
 
-    if (res.status !== 200) console.error('Bet failed:', res.data);
+    if (res.status !== 200) logError('Bet failed:', res.data);
     expect(res.status).toBe(200);
     roundId = res.data?.data?.roundId ?? '';
     expect(roundId).toBeTruthy();
@@ -83,7 +83,7 @@ export function runExpTests() {
     // 400/409 = "round is not in status for finish" — round already auto-closed
     //   (transient: stale round from a previous test session; resolves after ~20 min).
     if (res.status !== 200) {
-      console.warn('[exp/finish] Non-200:', res.status, JSON.stringify(res.data));
+      logWarn('[exp/finish] Non-200:', `${res.status}`, res.data);
     }
     expect([200, 400, 409]).toContain(res.status);
   });

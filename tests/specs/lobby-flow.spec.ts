@@ -8,7 +8,7 @@
  *                            → REFRESHED_ACCESS_TOKEN, REFRESHED_REFRESH_TOKEN
  */
 import { it, expect } from 'bun:test';
-import { api } from '../utils/api';
+import { api, logError, logWarn } from '../utils/api';
 import { GAME, SVC_SIG } from '../utils/config';
 
 export function runLobbyFlowTests() {
@@ -44,7 +44,7 @@ export function runLobbyFlowTests() {
       callback: 'http://localhost',
     }, { headers: SVC_SIG });
 
-    if (res.status !== 200) console.error('[lobby/step1] Session start failed:', res.data);
+    if (res.status !== 200) logError('[lobby/step1] Session start failed:', res.data);
     expect(res.status).toBe(200);
 
     const launchUrl = res.data?.data?.launchUrl ?? '';
@@ -70,7 +70,7 @@ export function runLobbyFlowTests() {
       },
     });
 
-    if (res.status !== 200) console.error('[lobby/step2] Activate failed:', res.data);
+    if (res.status !== 200) logError('[lobby/step2] Activate failed:', res.data);
     expect(res.status).toBe(200);
 
     // lobby-flow.sh: .token // .accessToken // .data.token // .data.accessToken
@@ -93,7 +93,7 @@ export function runLobbyFlowTests() {
       { headers: { authorization: `Bearer ${gameAccessToken}` } },
     );
 
-    if (res.status !== 200) console.error('[lobby/step3] Session-token activate failed:', res.data);
+    if (res.status !== 200) logError('[lobby/step3] Session-token activate failed:', res.data);
     expect(res.status).toBe(200);
 
     // lobby-flow.sh: .data.tokenType // .data.accessToken // .data.refreshToken // .data.expiresIn
@@ -121,7 +121,7 @@ export function runLobbyFlowTests() {
       { headers: { authorization: `Bearer ${lobbyAccessToken}` } },
     );
 
-    if (res.status !== 200) console.error('[lobby/step4] Session-token refresh failed:', res.data);
+    if (res.status !== 200) logError('[lobby/step4] Session-token refresh failed:', res.data);
     expect(res.status).toBe(200);
 
     // lobby-flow.sh: .data.accessToken // .data.refreshToken
