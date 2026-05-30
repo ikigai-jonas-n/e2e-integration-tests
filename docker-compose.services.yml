@@ -40,7 +40,7 @@ services:
 
   # ── remote-game-server ──────────────────────────────────────────────────────
   billing:
-    x-repo: remote-game-server
+    x-repo: remote-game-server-billing
     x-env-file: .env.billing.example
     x-setup:
       - npm install
@@ -75,8 +75,11 @@ services:
       retries: 30
 
   game-activity:
-    x-repo: remote-game-server
+    x-repo: remote-game-server     # main branch — triggers build for jobs too
     x-env-file: .env.game-activity.example
+    x-setup:
+      - npm install
+      - npm run build
     x-bridge-env:
       QUEUE_HOST_NAMES: "kafka-region:9093"
       REDIS_HOST: redis-cluster
@@ -94,8 +97,11 @@ services:
       retries: 30
 
   bridge:
-    x-repo: remote-game-server
+    x-repo: remote-game-server-bridge
     x-env-file: .env.bridge.example
+    x-setup:
+      - npm install
+      - npm run build
     x-bridge-env:
       QUEUE_HOST_NAMES: "kafka-region:9093"
       GLOBAL_QUEUE_HOST_NAMES: "kafka-global:9193"
@@ -161,8 +167,11 @@ services:
         condition: service_healthy
 
   game:
-    x-repo: remote-game-server
+    x-repo: remote-game-server-game
     x-env-file: .env.game.example
+    x-setup:
+      - npm install
+      - npm run build
     x-bridge-env:
       QUEUE_HOST_NAMES: "kafka-region:9093"
       GLOBAL_QUEUE_HOST_NAMES: "kafka-global:9193"
@@ -197,3 +206,7 @@ services:
       interval: 2s
       timeout: 3s
       retries: 30
+
+# NOTE: Observability tools (Seq, Dozzle) live in docker-compose.observability.yml.
+# They are started separately because this file contains native Bun-spawned services
+# that have no Docker image — Docker would reject the file if both were mixed here.

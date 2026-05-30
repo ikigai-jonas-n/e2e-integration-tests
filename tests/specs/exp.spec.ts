@@ -13,8 +13,8 @@ export function runExpTests() {
 
   it('Prerequisite: Creates a Session (/v2/service/session/start)', async () => {
     const res = await api.post(`${GAME}/v2/service/session/start`, {
-      gameCode: 'LGS-001', lang: 'en', country: 'GB',
-      gameSetting: { rtpConfigCode: 'highRTP', isGeoBlocking: true, jurisdictionCode: 'slotJD' },
+      gameCode: 'LGS-004', lang: 'en', country: 'GB',
+      gameSetting: { rtpConfigCode: 'RTP_97', isGeoBlocking: true, jurisdictionCode: 'slotJD' },
       mode: 'real', operator: 'QARealGameOperator', brand: 'QARealGameBrand',
       playerId: PLAYER_ID, externalPlayerId: EXT_PLAYER_ID,
       currency: 'EUR', currencyId: 1, balance: '10000', maxExposure: 0,

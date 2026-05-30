@@ -16,7 +16,7 @@ REDIS_PORT=6000
 INIT_WAIT=15        # Fixed initialization wait
 KAFKA_WAIT=15       # Default Kafka wait (changeable via -w)
 STARTUP_DELAY=3
-GAMES_INPUT="LGS-001"
+GAMES_INPUT="LGS-004"
 STARTUP_ORDER="billing,game,bridge"
 KILL_REDIS=false
 TOPOLOGIES=()
@@ -28,7 +28,7 @@ usage() {
     echo "Options:"
     echo "  -T <topology> Define an environment topology (can be used multiple times)"
     echo "  -k            Enable Redis flush (Case 3: Billing Site fallback)"
-    echo "  -f <games>    Comma-separated game codes (default: LGS-001)"
+    echo "  -f <games>    Comma-separated game codes (default: LGS-004)"
     echo "  -w <secs>     Wait time for KAFKA propagation (default: 15)"
     echo "  -s <order>    Startup order (default: billing,game,bridge)"
     exit 1

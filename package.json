@@ -5,7 +5,8 @@
   "main": "index.js",
   "scripts": {
     "test": "./run-e2e.sh",
-    "test:raw": "bun test --timeout 600000"
+    "test:raw": "bun test --timeout 600000",
+    "reset": "bash scripts/reset.sh"
   },
   "keywords": [],
   "author": "",

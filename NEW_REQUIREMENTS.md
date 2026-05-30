@@ -432,13 +432,13 @@ async function waitForCondition(conditionFn: () => Promise<boolean>, maxWaitMs =
 // In test:
 await waitForCondition(async () => {
   const games = await gameClient.getGames();
-  return games.find(g => g.code === 'LGS-001')?.enabled === false;
+  return games.find(g => g.code === 'LGS-004')?.enabled === false;
 });
 ```
 
 **D. Safe State Teardown**
 If an `expect()` fails in the middle of `runBetAndActionFlow`, the `afterAll` currently just shuts down Docker. If you run tests individually (as proposed in the logging upgrade), you risk leaving the Database in a dirty state (e.g., game disabled) for the next test file.
-**Fix:** Every flow should have an `afterAll` inside its own file that cleans up its logical state (e.g., re-enabling LGS-001, resetting player balances), completely separate from the Orchestrator's infrastructure teardown.
+**Fix:** Every flow should have an `afterAll` inside its own file that cleans up its logical state (e.g., re-enabling LGS-004, resetting player balances), completely separate from the Orchestrator's infrastructure teardown.
 
 {PORT} is a macro injected automatically by the orchestrator.
 

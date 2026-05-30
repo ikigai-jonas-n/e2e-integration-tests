@@ -17,24 +17,39 @@ interface OrchestratorGlobal {
 interface RepoConfig {
   repoPath: string;
   target: string;
+  /** Override the env file used when running db-migrations.
+   *  Required for repos whose first compose service lacks DB credentials
+   *  (e.g. bridge, game-activity). Use the service that owns the DB schema. */
+  migrationEnvFile?: string;
+  /** Env overrides applied on top of everything else — for BOTH migrations and
+   *  service runtime. Primary use: isolate each repo variant's DB by overriding
+   *  DB_NAME and MONGO_NAME so variants never share state. */
+  envOverrides?: Record<string, string>;
+}
+
+interface ObservabilityConfig {
+  seq?: boolean;
+  dozzle?: boolean;
 }
 
 interface OrchestratorConfig {
   global: OrchestratorGlobal;
   repos: Record<string, RepoConfig>;
+  observability?: ObservabilityConfig;
   composeServiceEnvOverrides?: Record<string, Record<string, Record<string, string>>>;
 }
 
 // ─── docker-compose.services.yml types ───────────────────────────────────────
 
 interface ComposeService {
-  // Orchestrator hints (x-* fields — Docker Compose ignores these)
-  'x-repo': string;
-  'x-env-file': string;
+  // Orchestrator hints (x-* fields — Docker Compose ignores these).
+  // Optional because observability services (seq, dozzle) are Docker-managed and lack these fields.
+  'x-repo'?: string;
+  'x-env-file'?: string;
   'x-setup'?: string[];
   'x-bridge-env'?: Record<string, string>;
   // Standard Docker Compose fields
-  command: string;
+  command?: string;
   environment?: Record<string, string> | string[];
   ports?: string[];
   healthcheck?: { test: string[] };
@@ -85,6 +100,145 @@ function dependsOn(svc: ComposeService): string[] {
   return Object.keys(d);
 }
 
+// ─── Seq CLEF log forwarder ───────────────────────────────────────────────────
+//
+// Strips ANSI terminal escape sequences (fallback for non-JSON log lines).
+const ANSI_RE = /\x1B\[[0-9;]*[a-zA-Z]/g;
+function stripAnsi(s: string): string { return s.replace(ANSI_RE, ''); }
+
+// Maps pino numeric level → CLEF level string for Seq.
+const PINO_LEVELS: Record<number, string> = {
+  10: 'Verbose', 20: 'Debug', 30: 'Information',
+  40: 'Warning', 50: 'Error', 60: 'Fatal',
+};
+
+// pino-pretty line format: [HH:MM:SS.mmm] LEVEL (pid): message
+// Used to detect and split concatenated pretty entries AND extract the timestamp.
+const PINO_PRETTY_BOUNDARY = /(?=\[\d{2}:\d{2}:\d{2}\.\d{3}\] (?:TRACE|DEBUG|INFO|WARN|ERROR|FATAL) )/g;
+const PINO_PRETTY_HEADER   = /^\[(\d{2}:\d{2}:\d{2}\.\d{3})\] (TRACE|DEBUG|INFO|WARN|ERROR|FATAL) /;
+
+const PINO_PRETTY_LEVELS: Record<string, string> = {
+  TRACE: 'Verbose', DEBUG: 'Debug', INFO: 'Information',
+  WARN: 'Warning', ERROR: 'Error', FATAL: 'Fatal',
+};
+
+/**
+ * Split a raw line into individual log entries.
+ * Handles the case where pino-pretty emits multiple entries without newlines between them.
+ */
+function splitLogEntries(line: string): string[] {
+  const stripped = stripAnsi(line);
+  const parts    = stripped.split(PINO_PRETTY_BOUNDARY).filter(Boolean);
+  return parts.length > 1 ? parts : [stripped];
+}
+
+/**
+ * Convert a single log line to a CLEF event string.
+ *
+ * Priority:
+ *  1. pino NDJSON (LOG_PRETTY=''): all structured fields become Seq properties
+ *  2. pino-pretty text: extracts timestamp + level for accurate Seq metadata
+ *  3. Plain text fallback
+ */
+function lineToClef(line: string, service: string, isError: boolean): string | null {
+  const trimmed = line.trim();
+  if (!trimmed) return null;
+
+  // 1. pino NDJSON (best — all properties searchable in Seq)
+  if (trimmed.startsWith('{')) {
+    try {
+      const { level, time, msg, pid, hostname, name, ...rest } = JSON.parse(trimmed);
+      const seqLevel = PINO_LEVELS[level as number] ?? (isError ? 'Error' : 'Information');
+      const ts       = typeof time === 'number' ? new Date(time).toISOString() : new Date().toISOString();
+      return JSON.stringify({
+        '@t': ts,
+        '@l': seqLevel,
+        '@m': String(msg ?? trimmed),
+        'Service': service,
+        ...rest,   // url, method, query, roundId, gameCode, etc. — all searchable in Seq
+      });
+    } catch { /* not valid JSON — fall through */ }
+  }
+
+  // 2. pino-pretty: extract timestamp and level for accurate Seq metadata
+  const clean  = stripAnsi(trimmed);
+  const header = clean.match(PINO_PRETTY_HEADER);
+  if (header) {
+    const [fullHeader, time, levelStr] = header;
+    const todayDate = new Date().toISOString().slice(0, 11); // "2026-05-30T"
+    return JSON.stringify({
+      '@t': `${todayDate}${time}Z`,
+      '@l': PINO_PRETTY_LEVELS[levelStr] ?? (isError ? 'Error' : 'Information'),
+      '@m': clean.slice(fullHeader.length).trim(),
+      'Service': service,
+    });
+  }
+
+  // 3. Plain text fallback (startup messages, non-pino output)
+  if (!clean) return null;
+  return JSON.stringify({
+    '@t': new Date().toISOString(),
+    '@l': isError ? 'Error' : 'Information',
+    '@m': clean,
+    'Service': service,
+  });
+}
+
+// Buffers CLEF log events and batch-flushes to Seq every 500ms.
+// Maintains a partial-line buffer so chunks that split a JSON line are reassembled.
+// Fire-and-forget: Seq failures are silently ignored (Seq is optional).
+
+class SeqForwarder {
+  private clefBuffer: string[] = [];
+  private lineAccum   = '';     // accumulates a partial line across chunks
+  private timer: ReturnType<typeof setInterval> | null = null;
+  readonly url: string;
+
+  constructor(baseUrl: string) {
+    this.url = `${baseUrl}/api/events/raw?clef`;
+    this.timer = setInterval(() => this.flush(), 500);
+  }
+
+  push(chunk: string, service: string, isError = false): void {
+    // Reassemble chunk with any leftover partial line from previous chunk
+    const text  = this.lineAccum + chunk;
+    const lines = text.split('\n');
+    // Last element is either empty (chunk ended with \n) or a partial line
+    this.lineAccum = lines.pop() ?? '';
+
+    for (const line of lines) {
+      // pino-pretty sometimes concatenates multiple entries without newlines.
+      // splitLogEntries detects pino-pretty boundaries and separates them.
+      for (const entry of splitLogEntries(line)) {
+        const event = lineToClef(entry, service, isError);
+        if (event) this.clefBuffer.push(event);
+      }
+    }
+    if (this.clefBuffer.length >= 50) this.flush();
+  }
+
+  private flush(): void {
+    if (!this.clefBuffer.length) return;
+    const body = this.clefBuffer.join('\n');
+    this.clefBuffer = [];
+    fetch(this.url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/vnd.serilog.clef' },
+      body,
+    }).catch(() => {}); // Seq being down must never crash tests
+  }
+
+  stop(): void {
+    if (this.timer) { clearInterval(this.timer); this.timer = null; }
+    // Flush any partial line left in the accumulator
+    if (this.lineAccum.trim()) {
+      const event = lineToClef(this.lineAccum, 'unknown', false);
+      if (event) this.clefBuffer.push(event);
+    }
+    this.flush();
+  }
+}
+
 // ─── Orchestrator ─────────────────────────────────────────────────────────────
 
 export class E2EOrchestrator {
@@ -95,6 +249,7 @@ export class E2EOrchestrator {
   private readonly skipPull = process.env.E2E_SKIP_PULL === '1';
 
   private _masterStream: ReturnType<typeof fs.createWriteStream> | null = null;
+  private _seq: SeqForwarder | null = null;
 
   // ─── Verbose ──────────────────────────────────────────────────────────────
 
@@ -214,12 +369,13 @@ export class E2EOrchestrator {
       console.log('   Services:  ⚠️  no health checks configured');
     }
 
-    // One build-cache check per repo (multiple services can share a repo)
+    // One build-cache check per repo (multiple services can share a repo).
+    // Skip observability services (seq, dozzle) that have no x-repo.
     const checkedRepos = new Set<string>();
     let allCached = true;
     for (const svc of Object.values(composeServices)) {
       const repo = svc['x-repo'];
-      if (checkedRepos.has(repo)) continue;
+      if (!repo || checkedRepos.has(repo)) continue;
       checkedRepos.add(repo);
       const svcDir = path.join(this.worktreeBase, repo);
       if (!fs.existsSync(path.join(svcDir, '.git'))) continue;
@@ -287,10 +443,15 @@ export class E2EOrchestrator {
    * Builds the final process environment for a service.
    * Merge order (later wins): process.env → x-env-file → environment → x-bridge-env (if network)
    */
-  private buildEnvironment(worktreeDir: string, svc: ComposeService): Record<string, string> {
-    const envPath = path.join(worktreeDir, svc['x-env-file']);
+  private buildEnvironment(
+    worktreeDir: string,
+    svc: ComposeService,
+    repoOverrides?: Record<string, string>,
+  ): Record<string, string> {
+    const envFilePath = svc['x-env-file'];
+    const envPath = envFilePath ? path.join(worktreeDir, envFilePath) : null;
     const fileEnv: Record<string, string> = {};
-    if (fs.existsSync(envPath)) {
+    if (envPath && fs.existsSync(envPath)) {
       fs.readFileSync(envPath, 'utf-8').split('\n').forEach(line => {
         const t = line.trim();
         if (t && !t.startsWith('#')) {
@@ -300,11 +461,19 @@ export class E2EOrchestrator {
       });
     }
     const bridgeEnv = this.network ? (svc['x-bridge-env'] ?? {}) : {};
+    // When Seq is enabled, disable pino-pretty so services emit raw NDJSON.
+    // The orchestrator then parses each line into rich CLEF events with all
+    // structured fields (url, method, roundId, etc.) searchable in Seq.
+    // Empty string is falsy in JS — disables pino-pretty regardless of whether the
+    // service checks `if (LOG_PRETTY)`, `LOG_PRETTY === 'true'`, or `!== 'false'`.
+    const seqEnv: Record<string, string> = orchestratorCfg.observability?.seq ? { LOG_PRETTY: '' } : {};
     return {
       ...(process.env as Record<string, string>),
       ...fileEnv,
       ...parseEnv(svc.environment),
       ...bridgeEnv,
+      ...seqEnv,
+      ...(repoOverrides ?? {}),  // highest priority: repo-level DB isolation overrides
       npm_config_cache: this.npmCacheDir,
     };
   }
@@ -316,7 +485,9 @@ export class E2EOrchestrator {
     const postmanValues: { key: string; value: string; type: string; enabled: boolean }[] = [];
     const rows: string[] = [];
 
+    // Only export native Node.js services (those with x-repo) — skip seq/dozzle
     for (const [name, svc] of Object.entries(composeServices)) {
+      if (!svc['x-repo']) continue;
       const port = hostPort(svc.ports);
       if (!port) continue;
       const url = `http://127.0.0.1:${port}`;
@@ -335,9 +506,18 @@ export class E2EOrchestrator {
     console.log(`│  Active Service Endpoints${' '.repeat(sep.length - 26)}│`);
     console.log(`├${sep}┤`);
     rows.forEach(r => console.log(`│${r.padEnd(sep.length + 1)}│`));
-    console.log(`└${sep}┘\n`);
+    console.log(`└${sep}┘`);
 
-    // Consumed by tests/utils/config.ts as a fast lookup after first run
+    // Print observability URLs separately (not included in Postman env)
+    const obs = orchestratorCfg.observability;
+    if (obs?.seq || obs?.dozzle) {
+      console.log('');
+      if (obs.seq)    console.log('   📈 Seq log browser  →  http://localhost:8081');
+      if (obs.dozzle) console.log('   🔍 Dozzle (infra)   →  http://localhost:9990');
+    }
+    console.log('');
+
+    // Consumed by tests/utils/config.ts as a fast lookup
     fs.writeFileSync('./.e2e-endpoints.json', JSON.stringify(endpoints, null, 2));
 
     // Drag-and-drop into Postman for manual API testing
@@ -364,13 +544,20 @@ export class E2EOrchestrator {
         const targetDir = path.join(this.worktreeBase, repoName);
         const repoPath  = path.resolve(repo.repoPath);
         if (fs.existsSync(path.join(targetDir, '.git'))) {
-          console.log(`   -> Pulling latest for ${repoName} @ ${repo.target}...`);
-          await this.runAsync('git reset --hard HEAD', targetDir);
-          await this.runAsync(`git pull origin ${repo.target}`, targetDir);
+          console.log(`   -> Updating ${repoName} @ ${repo.target}...`);
+          // --tags ensures version tags (1.7.10, 1.15.1, etc.) are fetched
+          await this.runAsync('git fetch --all --tags', targetDir);
+          // Try branch-style reset first; fall back to tag checkout on failure
+          try {
+            await this.runAsync(`git reset --hard origin/${repo.target}`, targetDir);
+          } catch {
+            // target is a tag (immutable) — just checkout, no remote tracking branch
+            await this.runAsync(`git checkout ${repo.target}`, targetDir);
+          }
         } else {
-          console.log(`   -> Cloning ${repoName} @ ${repo.target}...`);
+          console.log(`   -> Checking out ${repoName} @ ${repo.target}...`);
           if (fs.existsSync(targetDir)) fs.rmSync(targetDir, { recursive: true, force: true });
-          await this.runAsync('git fetch --all', repoPath);
+          await this.runAsync('git fetch --all --tags', repoPath);
           try { await this.runAsync('git worktree prune', repoPath); } catch {}
           await this.runAsync(`git worktree add -f ${targetDir} ${repo.target}`, repoPath);
         }
@@ -384,14 +571,53 @@ export class E2EOrchestrator {
       console.log(`🧹 Cold start: clearing stale processes on ports [${ports.join(', ')}]`);
       for (const port of ports) {
         try {
-          execSync(`lsof -i:${port} | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`);
+          execSync(`lsof -i:${port} -sTCP:LISTEN | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`);
         } catch {}
       }
     }
   }
 
+  private startObservability(): void {
+    const obs = orchestratorCfg.observability;
+    if (!obs?.seq && !obs?.dozzle) return;
+
+    const toStart: string[] = [
+      ...(obs.seq    ? ['seq']    : []),
+      ...(obs.dozzle ? ['dozzle'] : []),
+    ];
+
+    console.log(`📊 Starting observability: ${toStart.join(', ')} (pulling images if needed — this may take a moment on first run)...`);
+    try {
+      // stdout/stderr inherit → Docker pull progress goes straight to terminal.
+      // spawnSync blocks until images are pulled and containers are started.
+      const result = Bun.spawnSync(
+        ['docker', 'compose', '-f', './docker-compose.observability.yml', 'up', '-d', ...toStart],
+        { stdout: 'inherit', stderr: 'inherit' },
+      );
+      if (result.exitCode !== 0) {
+        console.warn('   ⚠️  Observability startup failed (non-fatal) — run manually to see error:');
+        console.warn('       docker compose -f docker-compose.observability.yml up -d');
+      }
+    } catch (e: any) {
+      console.warn(`   ⚠️  Observability startup failed (non-fatal): ${String(e.message).split('\n')[0]}`);
+    }
+
+    // Initialize Seq forwarder so Node.js service logs are forwarded
+    if (obs.seq) {
+      this._seq = new SeqForwarder('http://localhost:5341');
+      console.log('   📈 Seq log browser → http://localhost:8081');
+    }
+    if (obs.dozzle) {
+      console.log('   🔍 Dozzle live container logs → http://localhost:9990  (Docker containers only)');
+    }
+  }
+
   async startInfrastructure() {
     this.ensureDockerRunning();
+
+    // Always start observability (even on warm start — containers may need to be running)
+    this.startObservability();
+
     if (this._warmStart) {
       console.log('⚡ Warm start: skipping Docker infrastructure startup.');
       return;
@@ -436,20 +662,31 @@ export class E2EOrchestrator {
     }
     console.log('🗄️  Running DB Migrations...');
 
-    // Run migrations once per repo (multiple services may share a repo)
+    // Run migrations once per repo — every repo with a db-migrations directory runs.
+    // Each variant is isolated via envOverrides (different DB_NAME / MONGO_NAME).
     const reposMigrated = new Set<string>();
     for (const svc of Object.values(composeServices)) {
       const repo = svc['x-repo'];
-      if (reposMigrated.has(repo)) continue;
+      if (!repo || reposMigrated.has(repo)) continue;
+      const repoCfg = orchestratorCfg.repos[repo];
       const worktreeDir   = path.join(this.worktreeBase, repo);
       const migrationsDir = path.join(worktreeDir, 'db-migrations');
       if (!fs.existsSync(migrationsDir)) continue;
       reposMigrated.add(repo);
 
-      const migrationEnv = this.buildEnvironment(worktreeDir, svc);
-      const baseEnvPath  = path.join(worktreeDir, svc['x-env-file']);
+      // migrationEnvFile: use a different .env.*.example for migrations
+      //   (e.g. bridge/game-activity don't have DB credentials — borrow billing's)
+      // envOverrides: applied last — isolates this variant's DB from others
+      //   (DB_NAME=slot_bridge, MONGO_NAME=rgs_bridge, etc.)
+      const envFileToUse = repoCfg?.migrationEnvFile ?? svc['x-env-file'];
+      const svcForMigration: ComposeService = envFileToUse !== svc['x-env-file']
+        ? { ...svc, 'x-env-file': envFileToUse }
+        : svc;
+
+      const migrationEnv = this.buildEnvironment(worktreeDir, svcForMigration, repoCfg?.envOverrides);
+      const baseEnvPath  = envFileToUse ? path.join(worktreeDir, envFileToUse) : null;
       const destEnvPath  = path.join(worktreeDir, '.env');
-      if (fs.existsSync(baseEnvPath)) {
+      if (baseEnvPath && fs.existsSync(baseEnvPath)) {
         fs.copyFileSync(baseEnvPath, destEnvPath);
         const lines = Object.entries(parseEnv(svc.environment)).map(([k, v]) => `${k}=${v}`);
         if (lines.length) fs.appendFileSync(destEnvPath, '\n' + lines.join('\n') + '\n');
@@ -469,68 +706,99 @@ export class E2EOrchestrator {
   }
 
   async runServices() {
+    const seqEnabled = !!orchestratorCfg.observability?.seq;
+
     if (this._warmStart) {
-      console.log('⚡ Warm start: all services already running with current code.');
-      this.exportEndpoints();
-      return;
+      if (!seqEnabled) {
+        // Pure warm start: services already running, nothing to do
+        console.log('⚡ Warm start: all services already running with current code.');
+        this.exportEndpoints();
+        return;
+      }
+      // Seq is enabled: cannot attach to already-running processes.
+      // Kill them and respawn with stdout/stderr piped so Seq receives all logs.
+      // Build is still skipped — only the spawn step runs (~10-30s for health checks).
+      console.log('⚡ Warm start + Seq: respawning services for log capture (build skipped)...');
+      for (const port of this.portsToClear) {
+        try {
+          execSync(
+            `lsof -i:${port} -sTCP:LISTEN | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`,
+          );
+        } catch {}
+      }
+      // Fall through directly to the spawn phase — skip builds below
     }
 
-    console.log('🚀 Preparing Dependencies & Builds (Concurrently)...');
+    if (!this._warmStart) {
+      console.log('🚀 Preparing Dependencies & Builds (Concurrently)...');
+    }
 
-    // ── Phase 1: build (once per repo, git-hash cached) ──────────────────────
+    // ── Phase 1: build (once per repo, git-hash cached) — skipped on warm start ──
 
     const buildTasks: Promise<void>[] = [];
     const builtRepos = new Set<string>();
 
-    for (const svc of Object.values(composeServices)) {
-      const repo        = svc['x-repo'];
-      const setupCmds   = svc['x-setup'] ?? [];
-      const worktreeDir = path.join(this.worktreeBase, repo);
-      if (!setupCmds.length || builtRepos.has(repo)) continue;
-      builtRepos.add(repo);
+    if (!this._warmStart) {
+      for (const svc of Object.values(composeServices)) {
+        const repo        = svc['x-repo'];
+        const setupCmds   = svc['x-setup'] ?? [];
+        if (!repo || !setupCmds.length || builtRepos.has(repo)) continue;
+        const worktreeDir = path.join(this.worktreeBase, repo);
+        builtRepos.add(repo);
 
-      buildTasks.push((async () => {
-        if (this.isBuildCached(worktreeDir)) {
-          console.log(`   [CACHE HIT] ${repo}: skipping install & build`);
-          return;
-        }
-        const mergedEnv = this.buildEnvironment(worktreeDir, svc);
-        for (const cmd of setupCmds) {
-          console.log(`   [BUILD] ${repo}: ${cmd}`);
-          const proc = Bun.spawn(['sh', '-c', cmd], { cwd: worktreeDir, env: mergedEnv as any });
-          await proc.exited;
-          if (proc.exitCode !== 0) {
-            const err = await new Response(proc.stderr).text();
-            throw new Error(`Build failed for ${repo}: ${err}`);
+        buildTasks.push((async () => {
+          if (this.isBuildCached(worktreeDir)) {
+            console.log(`   [CACHE HIT] ${repo}: skipping install & build`);
+            return;
           }
-        }
-        this.writeBuildCache(worktreeDir);
-      })());
+          const mergedEnv = this.buildEnvironment(worktreeDir, svc);
+          for (const cmd of setupCmds) {
+            console.log(`   [BUILD] ${repo}: ${cmd}`);
+            const proc = Bun.spawn(['sh', '-c', cmd], { cwd: worktreeDir, env: mergedEnv as any });
+            await proc.exited;
+            if (proc.exitCode !== 0) {
+              const err = await new Response(proc.stderr).text();
+              throw new Error(`Build failed for ${repo}: ${err}`);
+            }
+          }
+          this.writeBuildCache(worktreeDir);
+        })());
+      }
+      await Promise.all(buildTasks);
     }
-
-    await Promise.all(buildTasks);
 
     // ── Phase 2: start services, honouring depends_on ─────────────────────────
     //
     // Each service gets a "ready" promise that resolves once its healthcheck passes
     // (or immediately if no healthcheck). Dependents await their deps' ready promises
     // before spawning — replacing `while ! curl` bash hacks with native logic.
+    //
+    // Services without x-repo (Seq, Dozzle) are Docker containers managed by
+    // startObservability() — skip them here.
 
     console.log('\n🚀 Starting Node Servers...');
     const verboseMode  = this.verbose;
     const masterStream = this.ensureMasterStream();
 
-    // Register all ready promises upfront so deps can reference them immediately
+    // Only native services (those with x-repo) are spawned by the orchestrator
+    const nativeServices = Object.entries(composeServices)
+      .filter(([, svc]) => Boolean(svc['x-repo'])) as [string, ComposeService][];
+
+    // Register all ready promises upfront so deps can reference them immediately.
+    // IMPORTANT: must separate Promise creation from the object literal so that
+    // the Promise constructor (which assigns `resolve`) runs BEFORE the shorthand
+    // `{ resolve }` captures its value — otherwise `resolve` is captured as undefined.
     const readyMap = new Map<string, { resolve: () => void; promise: Promise<void> }>();
-    for (const name of Object.keys(composeServices)) {
+    for (const [name] of nativeServices) {
       let resolve!: () => void;
-      readyMap.set(name, { resolve, promise: new Promise<void>(r => { resolve = r; }) });
+      const promise = new Promise<void>(r => { resolve = r; }); // executor runs sync → resolve is now a function
+      readyMap.set(name, { resolve, promise });
     }
 
     // Track actual health-check failures separately from dep-coordination
     const healthCheckResults: Promise<void>[] = [];
 
-    const launchTasks = Object.entries(composeServices).map(([name, svc]) => (async () => {
+    const launchTasks = nativeServices.map(([name, svc]) => (async () => {
       // Await declared dependencies before starting
       const deps = dependsOn(svc);
       if (deps.length > 0) {
@@ -542,37 +810,41 @@ export class E2EOrchestrator {
         }
       }
 
-      const worktreeDir   = path.join(this.worktreeBase, svc['x-repo']);
+      // nativeServices filter guarantees x-repo and command are present
+      const worktreeDir   = path.join(this.worktreeBase, svc['x-repo']!);
       const port          = hostPort(svc.ports) ?? 0;
       const hcUrl         = healthCheckUrl(svc);
-      const mergedEnv     = this.buildEnvironment(worktreeDir, svc);
+      const repoEnvOverrides = orchestratorCfg.repos[svc['x-repo']!]?.envOverrides;
+      const mergedEnv     = this.buildEnvironment(worktreeDir, svc, repoEnvOverrides);
       const serviceStream = this.openServiceStream(name, port);
       const dec           = new TextDecoder();
 
-      console.log(`   [START] ${name}: ${svc.command}`);
-      const proc = Bun.spawn(['sh', '-c', svc.command], {
+      console.log(`   [START] ${name}: ${svc.command!}`);
+      const proc = Bun.spawn(['sh', '-c', svc.command!], {
         cwd: worktreeDir,
         env: mergedEnv as any,
         stdout: 'pipe',
         stderr: 'pipe',
       });
 
-      // stdout → per-service log (raw) + master log (prefixed) + terminal if verbose=true
+      // stdout → service log (raw) + master log (prefixed) + Seq + terminal if verbose=true
       proc.stdout?.pipeTo(new WritableStream({
         write: chunk => {
           const text = dec.decode(chunk);
           serviceStream?.write(text);
           masterStream?.write(`[${name}] ${text}`);
+          this._seq?.push(text, name, false);
           if (verboseMode === true) process.stdout.write(`[${name}] ${text}`);
         },
       }));
 
-      // stderr → per-service log (raw) + master log (prefixed) + terminal if verbose or "errors"
+      // stderr → service log (raw) + master log (prefixed) + Seq + terminal if verbose or "errors"
       proc.stderr?.pipeTo(new WritableStream({
         write: chunk => {
           const text = dec.decode(chunk);
           serviceStream?.write(text);
           masterStream?.write(`[${name} ERR] ${text}`);
+          this._seq?.push(text, name, true);
           if (verboseMode === true || verboseMode === 'errors') process.stderr.write(`[${name} ERR] ${text}`);
         },
       }));
@@ -621,18 +893,35 @@ export class E2EOrchestrator {
     }
 
     console.log('\n🛑 Tearing down E2E Environment...');
+    this._seq?.stop();
     this.activeProcesses.forEach(proc => { try { proc.kill('SIGKILL'); } catch {} });
     for (const port of this.portsToClear) {
-      try { execSync(`lsof -i:${port} | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`); } catch {}
+      try { execSync(`lsof -i:${port} -sTCP:LISTEN | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`); } catch {}
     }
 
     if (fs.existsSync(this.worktreeBase)) {
+      // Multiple repos may share the same repoPath (e.g. remote-game-server-billing,
+      // remote-game-server-bridge all point to ../remote-game-server).
+      // Run docker compose down ONCE per unique source repo to avoid hanging on
+      // already-stopped containers.
+      const composedDown = new Set<string>();
+
       for (const [repoName, repo] of Object.entries(orchestratorCfg.repos)) {
-        const dir = path.join(this.worktreeBase, repoName);
-        if (fs.existsSync(path.join(dir, 'docker-compose.yml'))) {
-          try { Bun.spawnSync(['docker', 'compose', 'down', '-v', '--remove-orphans'], { cwd: dir }); } catch {}
+        const dir        = path.join(this.worktreeBase, repoName);
+        const repoPath   = path.resolve(repo.repoPath);
+        const composeFile = path.join(dir, 'docker-compose.yml');
+
+        if (fs.existsSync(composeFile) && !composedDown.has(repoPath)) {
+          composedDown.add(repoPath);
+          console.log(`   -> Stopping ${repoName} infra...`);
+          try {
+            Bun.spawnSync(
+              ['docker', 'compose', 'down', '--timeout', '10', '-v', '--remove-orphans'],
+              { cwd: dir, stdout: 'inherit', stderr: 'inherit' },
+            );
+          } catch {}
         }
-        try { Bun.spawnSync(['git', 'worktree', 'remove', '-f', dir], { cwd: path.resolve(repo.repoPath) }); } catch {}
+        try { Bun.spawnSync(['git', 'worktree', 'remove', '-f', dir], { cwd: repoPath }); } catch {}
       }
       fs.rmSync(this.worktreeBase, { recursive: true, force: true });
     }

@@ -224,12 +224,12 @@ Server stack frames (`at RoundService...`) are intentionally excluded — they'r
 Tests are registered in `e2e.spec.ts` via `describe(name, runFn)`. The run order matters:
 
 1. **Service APIs** — healthchecks, `GET /v2/service/games`, `GET /v2/service/sync-games`
-2. **Internal APIs** — AM token, disable/re-enable LGS-001 (uses `propagateConfig`)
+2. **Internal APIs** — AM token, disable/re-enable LGS-004 (uses `propagateConfig`)
 3. **Experience APIs** — individual exp/* endpoint tests
 4. **Flow: Bet + Action** — full session→activate→bet→action?→finish? lifecycle
 5. **Flow: Lobby Session Token** — session-token activate + refresh
 6. **Flow: Game Maintenance** — isMaintenance toggle, verified via sync-games (no cron wait)
-7. **Flow: Bridge & State Propagation** — LAST because it disables/re-enables LGS-001 (65s poll)
+7. **Flow: Bridge & State Propagation** — LAST because it disables/re-enables LGS-004 (65s poll)
 
 ---
 
@@ -245,7 +245,7 @@ Tests are registered in `e2e.spec.ts` via `describe(name, runFn)`. The run order
 The ONLY way to eliminate the 65s poll in `bridge-flow.spec.ts` and `internal.spec.ts` is to add a `POST /v2/service/force-games-sync` endpoint to the game node (PERIPHERAL) that calls `gamesCollectionSyncJob.process()`. This would require a change to `remote-game-server`.
 
 ### service.spec.ts — currencies field
-`Billing /v2/service/sync-games has LGS-001 with currencies` checks `Array.isArray(game.currencies)`. This field exists in the actual API response (confirmed by passing tests) but isn't in the TypeBox DTO definition that was inspected. Don't remove this test.
+`Billing /v2/service/sync-games has LGS-004 with currencies` checks `Array.isArray(game.currencies)`. This field exists in the actual API response (confirmed by passing tests) but isn't in the TypeBox DTO definition that was inspected. Don't remove this test.
 
 ### Lobby flow — session left open
 `lobby-flow.spec.ts` starts a session but does NOT close it (no `/v2/service/session/stop`). The `job-close-inactive` service handles cleanup. If the test runs frequently, it accumulates open sessions for `kyle0c`.

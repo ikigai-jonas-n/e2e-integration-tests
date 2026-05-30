@@ -175,7 +175,7 @@ bun test
        → parallel healthcheck polling
   └─ tests/e2e.spec.ts
        → poll game node until process cache loaded
-       → seed EUR bet levels for LGS-001
+       → seed EUR bet levels for LGS-004
        → run test flows
   └─ E2EOrchestrator.teardown()
        → SIGKILL all spawned node processes

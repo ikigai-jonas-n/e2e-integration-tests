@@ -76,12 +76,12 @@ export const gameClient = {
     currency?: string;
   } = {}) {
     const {
-      gameCode         = 'LGS-001',
+      gameCode         = 'LGS-004',
       playerId         = KYLE.playerId,
       externalPlayerId = KYLE.externalPlayerId,
       operator         = KYLE.operator,
       brand            = KYLE.brand,
-      rtpCode          = 'lowRTP',
+      rtpCode          = 'RTP_97',
       country          = 'GB',
       currency         = 'EUR',
     } = opts;

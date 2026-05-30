@@ -1,0 +1,52 @@
+# Observability stack for E2E test suite.
+# Started automatically by the orchestrator when e2e-orchestrator.yml:
+#   observability.seq: true
+#   observability.dozzle: true
+#
+# Can also be started manually:
+#   docker compose -f docker-compose.observability.yml up -d
+
+services:
+
+  # ── Seq — structured log browser ──────────────────────────────────────────
+  # Receives ALL Node.js service logs via orchestrator CLEF HTTP forwarding.
+  # Logs persist in Docker volume seq-data even after container restarts.
+  #
+  # Web UI:   http://localhost:8081
+  # Ingest:   http://localhost:5341/api/events/raw?clef
+  #
+  # Seq listens internally on BOTH port 80 (web UI + REST API) and port 5341 (CLEF ingestion).
+  # Port mappings:
+  #   5341:5341 → CLEF ingestion used by the orchestrator
+  #   8081:80   → web UI opened in the browser
+  seq:
+    image: datalust/seq:latest
+    environment:
+      - ACCEPT_EULA=Y
+      # Seq 2025.x requires explicit first-run auth config.
+      # For local dev, disable auth so no login is needed.
+      - SEQ_FIRSTRUN_NOAUTHENTICATION=true
+    ports:
+      - "5341:5341"   # CLEF ingestion: http://localhost:5341/api/events/raw?clef
+      - "8081:80"     # Web UI:         http://localhost:8081
+    volumes:
+      - seq-data:/data
+    restart: unless-stopped
+
+  # ── Dozzle — live container log viewer ─────────────────────────────────────
+  # Zero-config tail for Docker containers: Kafka, Postgres, MongoDB, Redis, RustFS.
+  # Node.js services run via Bun.spawn (not Docker) — they do NOT appear here.
+  # Use Seq for Node.js service logs.
+  #
+  # Web UI: http://localhost:9990
+  # (port 9990 avoids collision with billing on 8080)
+  dozzle:
+    image: amir20/dozzle:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    ports:
+      - "9990:8080"
+    restart: unless-stopped
+
+volumes:
+  seq-data:   # persistent — Seq log data survives container restarts

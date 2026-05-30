@@ -110,7 +110,7 @@ describe('Flow: Game Maintenance', () => {
   runMaintenanceFlowTests();
 });
 
-// Bridge flow last — it disables / re-enables LGS-001 (may affect cron state)
+// Bridge flow last — it disables / re-enables LGS-004 (may affect cron state)
 describe('Flow: Bridge & State Propagation', () => {
   const m = suiteMarkers('flow-bridge');
   beforeAll(m.beforeAll);

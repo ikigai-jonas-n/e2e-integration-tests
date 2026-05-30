@@ -12,7 +12,7 @@ import { BILLING, SVC_SIG } from '../utils/config';
 
 export function runMaintenanceFlowTests() {
   let amToken = '';
-  const GAME_CODE = 'LGS-001';
+  const GAME_CODE = 'LGS-004';
 
   it('Step 1: Get AM Token with maintenance permission', async () => {
     // maintenance-flow.sh: routeKey V1_INTERNAL_GAME_MAINTENANCE, account=tester, code=SLT

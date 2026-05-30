@@ -13,28 +13,28 @@ export function runServiceTests() {
     expect(res.status).toBe(200);
   });
 
-  it('Billing /v2/service/games lists LGS-001', async () => {
+  it('Billing /v2/service/games lists LGS-004', async () => {
     const res = await api.get(`${BILLING}/v2/service/games`, { headers: SVC_SIG });
     expect(res.status).toBe(200);
     const games = res.data?.data?.games ?? res.data?.data;
-    const game = games?.find((g: any) => g.code === 'LGS-001');
+    const game = games?.find((g: any) => g.code === 'LGS-004');
     expect(game).toBeDefined();
   });
 
-  it('Billing /v2/service/sync-games has LGS-001 with currencies', async () => {
+  it('Billing /v2/service/sync-games has LGS-004 with currencies', async () => {
     const res = await api.get(`${BILLING}/v2/service/sync-games`, { headers: SVC_SIG });
     expect(res.status).toBe(200);
     const games = res.data?.data?.games ?? res.data?.data;
-    const game = games?.find((g: any) => g.code === 'LGS-001');
+    const game = games?.find((g: any) => g.code === 'LGS-004');
     expect(game).toBeDefined();
     expect(Array.isArray(game.currencies)).toBe(true);
   });
 
-  it('Game node /v2/service/games lists LGS-001', async () => {
+  it('Game node /v2/service/games lists LGS-004', async () => {
     const res = await api.get(`${GAME}/v2/service/games`, { headers: SVC_SIG });
     expect(res.status).toBe(200);
     const games = res.data?.data?.games ?? res.data?.data;
-    const game = games?.find((g: any) => g.code === 'LGS-001');
+    const game = games?.find((g: any) => g.code === 'LGS-004');
     expect(game).toBeDefined();
   });
 }

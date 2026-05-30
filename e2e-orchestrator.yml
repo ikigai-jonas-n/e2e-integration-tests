@@ -24,17 +24,61 @@ global:
   network: null
 
 # Git repos to check out as worktrees before starting services.
-# The orchestrator pulls each repo and caches the build by HEAD+dirty hash.
+# target can be a branch name OR a version tag — both are supported.
+# Multiple entries can point to the same repoPath with different targets.
+# Each entry gets its own worktree directory and independent build cache.
 repos:
   queue-service:
     repoPath: "../queue-service"
     target: "main"
+
   slot-game-server:
     repoPath: "../slot-game-server"
-    target: "main"
+    target: "1.15.0"
+
+  # remote-game-server — one worktree per version
+  # services sharing the same worktree key share a single build (npm install + build runs once)
+  # Each remote-game-server variant gets its own isolated Postgres (DB_NAME) and
+  # MongoDB (MONGO_NAME) database so schema changes across versions never interfere.
+  # Variants without DB credentials in their first service's env file use
+  # migrationEnvFile to borrow billing's credentials (host/port/user/pass),
+  # while envOverrides changes the database name to keep them isolated.
+
   remote-game-server:
     repoPath: "../remote-game-server"
-    target: "main"
+    target: "main"                          # game-activity, job-stale-rounds, job-close-inactive
+    migrationEnvFile: ".env.billing.example"  # first svc (game-activity) has no DB credentials
+    envOverrides:
+      DB_NAME: "slot_main"
+      MONGO_NAME: "rgs_main"
+
+  remote-game-server-billing:
+    repoPath: "../remote-game-server"
+    target: "1.7.10"                        # billing
+    # uses billing env by default — has all DB credentials
+    # DB_NAME=slot, MONGO_NAME=rgs (defaults from .env.billing.example)
+
+  remote-game-server-bridge:
+    repoPath: "../remote-game-server"
+    target: "1.8.0"                         # bridge
+    migrationEnvFile: ".env.billing.example"  # bridge env has no DB credentials
+
+  remote-game-server-game:
+    repoPath: "../remote-game-server"
+    target: "1.15.1"                        # game
+    migrationEnvFile: ".env.billing.example"  # game env may lack postgres credentials
+
+# Observability tools started automatically alongside infra.
+observability:
+  # Seq structured log browser — receives ALL Node.js service logs via CLEF HTTP forwarding.
+  # Logs persist across runs (Docker volume). Browse at http://localhost:8081
+  # Toggle off for CI (file-based logs are sufficient there).
+  seq: true
+
+  # Dozzle live container log viewer — Docker containers only (Kafka, Postgres, Redis, etc.).
+  # Node.js services run natively via Bun.spawn; use Seq for those.
+  # Browse at http://localhost:9990
+  dozzle: true
 
 # Per docker-compose-container env overrides applied when global.network is set.
 # These patch the advertised listeners in the infra containers for bridge networking.

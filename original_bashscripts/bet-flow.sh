@@ -27,8 +27,8 @@ if [[ -z "${GAME_CODE:-}" ]]; then
 fi
 
 RTP_CONFIG_CODE="RTP_97"
-if [[ "${GAME_CODE}" == "LGS-001" ]]; then
-  RTP_CONFIG_CODE="lowRTP"
+if [[ "${GAME_CODE}" == "LGS-004" ]]; then
+  RTP_CONFIG_CODE="RTP_97"
 fi
 
 SESSION_START_PAYLOAD=$(jq -n \

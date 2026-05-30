@@ -5,9 +5,9 @@ import { billingClient, gameClient } from '../utils/client';
 export function runInternalTests() {
   let amToken = '';
 
-  // Safety net: always restore LGS-001 even if an assertion fails mid-flow.
+  // Safety net: always restore LGS-004 even if an assertion fails mid-flow.
   afterAll(async () => {
-    if (amToken) await api.resetGameState('LGS-001', amToken).catch(() => {});
+    if (amToken) await api.resetGameState('LGS-004', amToken).catch(() => {});
   }, 30000);
 
   it('Generates AM Token', async () => {
@@ -17,8 +17,8 @@ export function runInternalTests() {
     expect(amToken).toBeTruthy();
   });
 
-  it('Disables LGS-001 globally and propagates via Kafka', async () => {
-    const res = await billingClient.setGamesStatus(amToken, [{ code: 'LGS-001', enabled: false }]);
+  it('Disables LGS-004 globally and propagates via Kafka', async () => {
+    const res = await billingClient.setGamesStatus(amToken, [{ code: 'LGS-004', enabled: false }]);
     expect(res.status).toBe(200);
     // Redis eviction ensures billing-fallback on next cron — see api.propagateConfig
     await api.propagateConfig(amToken);
@@ -29,17 +29,17 @@ export function runInternalTests() {
     await waitForCondition(async () => {
       const res   = await gameClient.getGames();
       const games = res.data?.data?.games ?? res.data?.data;
-      return games?.find((g: any) => g.code === 'LGS-001')?.enabled === false;
+      return games?.find((g: any) => g.code === 'LGS-004')?.enabled === false;
     }, 65000);
   }, 90000);
 
-  it('Restores LGS-001 to enabled with EUR bet level 2', async () => {
-    await api.resetGameState('LGS-001', amToken);
+  it('Restores LGS-004 to enabled with EUR bet level 2', async () => {
+    await api.resetGameState('LGS-004', amToken);
 
     await waitForCondition(async () => {
       const res   = await gameClient.getGames();
       const games = res.data?.data?.games ?? res.data?.data;
-      return games?.find((g: any) => g.code === 'LGS-001')?.enabled === true;
+      return games?.find((g: any) => g.code === 'LGS-004')?.enabled === true;
     }, 65000);
   }, 90000);
 }
