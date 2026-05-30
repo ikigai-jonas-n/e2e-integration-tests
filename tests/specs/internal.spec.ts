@@ -1,6 +1,13 @@
 import { it, expect, afterAll } from 'bun:test';
 import { api, waitForCondition } from '../utils/api';
 import { billingClient, gameClient } from '../utils/client';
+import { atLeast } from '../utils/version-gate';
+
+// Kafka propagation (billing → bridge → Redis → game node) requires bridge to
+// correctly process billing's game-update messages.
+// bridge 1.8.0 added strict schema validation that rejects billing 1.7.x messages,
+// so the propagation tests are gated on both services being >= 1.8.0.
+const kafkaCompatible = atLeast('billing', '1.8.0') && atLeast('bridge', '1.8.0');
 
 export function runInternalTests() {
   let amToken = '';
@@ -17,29 +24,31 @@ export function runInternalTests() {
     expect(amToken).toBeTruthy();
   });
 
-  it('Disables LGS-004 globally and propagates via Kafka', async () => {
+  // @requires billing >= 1.8.0 && bridge >= 1.8.0  (Kafka propagation path)
+  it.if(kafkaCompatible)('Disables LGS-004 globally and propagates via Kafka', async () => {
     const res = await billingClient.setGamesStatus(amToken, [{ code: 'LGS-004', enabled: false }]);
     expect(res.status).toBe(200);
-    // Redis eviction ensures billing-fallback on next cron — see api.propagateConfig
     await api.propagateConfig(amToken);
   });
 
-  it('Game node reflects disabled state within 65s (cron-based)', async () => {
-    // 65s = 60s max cron interval + 5s buffer.
+  // @requires billing >= 1.8.0 && bridge >= 1.8.0
+  it.if(kafkaCompatible)('Game node reflects disabled state within 90s (cron-based)', async () => {
+    // 90s = 60s max cron interval + 30s buffer for Kafka consumer init on warm-start.
     await waitForCondition(async () => {
       const res   = await gameClient.getGames();
       const games = res.data?.data?.games ?? res.data?.data;
       return games?.find((g: any) => g.code === 'LGS-004')?.enabled === false;
-    }, 65000);
-  }, 90000);
+    }, 90000);
+  }, 120000);
 
-  it('Restores LGS-004 to enabled with EUR bet level 2', async () => {
+  // @requires billing >= 1.8.0 && bridge >= 1.8.0
+  it.if(kafkaCompatible)('Restores LGS-004 to enabled with EUR bet level 2', async () => {
     await api.resetGameState('LGS-004', amToken);
 
     await waitForCondition(async () => {
       const res   = await gameClient.getGames();
       const games = res.data?.data?.games ?? res.data?.data;
       return games?.find((g: any) => g.code === 'LGS-004')?.enabled === true;
-    }, 65000);
-  }, 90000);
+    }, 90000);
+  }, 120000);
 }

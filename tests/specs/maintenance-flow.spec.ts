@@ -5,9 +5,13 @@
  *   3. Verify maintenance = true  via billing /v2/service/sync-games
  *   4. Restore maintenance = false
  *   5. Verify maintenance = false
+ *
+ * Steps 2-5 require billing >= 1.8.0 (patchMaintenance added to registerCoreServiceEndpoints).
+ * On older billing versions they are automatically skipped — no need to comment them out.
  */
 import { it, expect } from 'bun:test';
-import { api, logError, logWarn } from '../utils/api';
+import { api, logError } from '../utils/api';
+import { atLeast } from '../utils/version-gate';
 import { BILLING, SVC_SIG } from '../utils/config';
 
 export function runMaintenanceFlowTests() {
@@ -15,7 +19,6 @@ export function runMaintenanceFlowTests() {
   const GAME_CODE = 'LGS-004';
 
   it('Step 1: Get AM Token with maintenance permission', async () => {
-    // maintenance-flow.sh: routeKey V1_INTERNAL_GAME_MAINTENANCE, account=tester, code=SLT
     const res = await api.post(`${BILLING}/v1/service/am/token`, {
       userId: 0,
       account: 'tester',
@@ -26,13 +29,12 @@ export function runMaintenanceFlowTests() {
     if (res.status !== 200) logError('[maint/step1] AM token failed:', res.data);
     expect(res.status).toBe(200);
 
-    // maintenance-flow.sh: .data.token
     amToken = res.data?.data?.token ?? '';
     expect(amToken).toBeTruthy();
   });
 
-  it('Step 2: Set isMaintenance = true', async () => {
-    // maintenance-flow.sh: PATCH /v1/internal/game/${GAME_CODE}/maintenance  { isMaintenance: true }
+  // @requires billing >= 1.8.0  (patchMaintenance endpoint)
+  it.if(atLeast('billing', '1.8.0'))('Step 2: Set isMaintenance = true', async () => {
     const res = await api.patch(
       `${BILLING}/v1/internal/game/${GAME_CODE}/maintenance`,
       { isMaintenance: true },
@@ -43,8 +45,8 @@ export function runMaintenanceFlowTests() {
     expect(res.status).toBe(200);
   });
 
-  it('Step 3: Billing confirms isMaintenance = true', async () => {
-    // Verify via sync-games (reads directly from DB — no cron dependency)
+  // @requires billing >= 1.8.0
+  it.if(atLeast('billing', '1.8.0'))('Step 3: Billing confirms isMaintenance = true', async () => {
     const res = await api.get(`${BILLING}/v2/service/sync-games`, { headers: SVC_SIG });
     expect(res.status).toBe(200);
 
@@ -55,7 +57,8 @@ export function runMaintenanceFlowTests() {
     expect(game?.isMaintenance).toBe(true);
   });
 
-  it('Step 4: Restore isMaintenance = false', async () => {
+  // @requires billing >= 1.8.0
+  it.if(atLeast('billing', '1.8.0'))('Step 4: Restore isMaintenance = false', async () => {
     const res = await api.patch(
       `${BILLING}/v1/internal/game/${GAME_CODE}/maintenance`,
       { isMaintenance: false },
@@ -66,7 +69,8 @@ export function runMaintenanceFlowTests() {
     expect(res.status).toBe(200);
   });
 
-  it('Step 5: Billing confirms isMaintenance = false', async () => {
+  // @requires billing >= 1.8.0
+  it.if(atLeast('billing', '1.8.0'))('Step 5: Billing confirms isMaintenance = false', async () => {
     const res = await api.get(`${BILLING}/v2/service/sync-games`, { headers: SVC_SIG });
     expect(res.status).toBe(200);
 

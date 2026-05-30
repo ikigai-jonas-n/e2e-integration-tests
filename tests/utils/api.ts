@@ -94,12 +94,14 @@ export const api = {
     //    returns false (empty registry) → immediately falls back to syncGamesFromBillingSiteToProcessCache()
     //    which calls billing directly and gets guaranteed-fresh data.
     //    Without this, the cron might load stale Redis data from before the PATCH.
-    try {
-      Bun.spawnSync([
-        'docker', 'exec', 'redis-cluster',
-        'valkey-cli', '-c', '-p', '6000', 'DEL', '{no_version}:gameCodes',
-      ]);
-    } catch { /* non-fatal — falls back to cron-reads-Redis path if eviction fails */ }
+    // Note: Redis eviction is intentionally NOT done here.
+    // The game node (PERIPHERAL) syncs from Redis, populated by Bridge on startup.
+    // Evicting the gameCodes key forces a billing API fallback, but billing's
+    // sync-games response omits 'isMaintenance', causing Fastify schema errors
+    // on the game node's /v2/service/games endpoint.
+    // State propagation therefore depends on Kafka (Bridge receiving + writing Redis).
+    // When Bridge schema rejects billing Kafka messages (version mismatch), these
+    // cron-based tests must be version-gated — see internal.spec.ts / bridge-flow.spec.ts.
   },
 
   /**

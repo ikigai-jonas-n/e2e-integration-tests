@@ -22,30 +22,35 @@ beforeAll(async () => {
   await orchestrator.runGlobalMigrations();
   await orchestrator.runServices();
 
-  log('[setup] Waiting for caches to warm up...');
+  log('[setup] Waiting for caches to warm up (Billing + Game)...');
   let cacheReady = false;
-  for (let i = 0; i < 90; i++) {
+  // Increase timeout to 120s for slow cold starts
+  for (let i = 0; i < 120; i++) {
     try {
-      const bRes = await api.get(`${BILLING}/v2/service/games`, { headers: SVC_SIG });
-      const gRes = await api.get(`${GAME}/v2/service/games`, { headers: SVC_SIG });
+      const [bRes, gRes] = await Promise.all([
+        api.get(`${BILLING}/v2/service/games`, { headers: SVC_SIG }),
+        api.get(`${GAME}/v2/service/games`, { headers: SVC_SIG })
+      ]);
 
-      const bGames = bRes.data?.data?.games ?? bRes.data?.data;
-      const gGames = gRes.data?.data?.games ?? gRes.data?.data;
+      const bGames = bRes.data?.data?.games ?? bRes.data?.data ?? [];
+      const gGames = gRes.data?.data?.games ?? gRes.data?.data ?? [];
 
-      if (Array.isArray(bGames) && bGames.length > 0 && Array.isArray(gGames) && gGames.length > 0) {
-        log(`[setup] Both caches ready after ~${i}s (billing: ${bGames.length}, game: ${gGames.length} games)`);
+      if (bGames.length > 0 && gGames.length > 0) {
+        log(`[setup] Caches ready: Billing(${bGames.length}), Game(${gGames.length})`);
         cacheReady = true;
         break;
       }
-      if (i > 0 && i % 15 === 0) {
-        const bOk = Array.isArray(bGames) && bGames.length > 0;
-        const gOk = Array.isArray(gGames) && gGames.length > 0;
-        log(`[setup] Still waiting... billing=${bOk ? 'ready' : 'empty'}, game=${gOk ? 'ready' : 'empty'}`);
+      
+      if (i % 10 === 0) {
+        log(`[setup] Progress: Billing=${bGames.length} games, Game=${gGames.length} games...`);
       }
-    } catch {}
+    } catch (e) {
+      if (i % 20 === 0) log(`[setup] Connection pending...`);
+    }
     await new Promise(r => setTimeout(r, 1000));
   }
-  if (!cacheReady) throw new Error('Timeout waiting for process caches (billing + game node).');
+
+  if (!cacheReady) throw new Error('Timeout: Services online but process caches are empty. Check DB connectivity.');
   log('✅ Setup complete.');
 }, 600000);
 
