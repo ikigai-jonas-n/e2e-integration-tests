@@ -489,7 +489,10 @@ export class E2EOrchestrator {
 
   private runAsync(cmd: string, cwd: string, env: any = process.env): Promise<void> {
     return new Promise((resolve, reject) => {
-      const proc = Bun.spawn(cmd.split(' '), { cwd, env, stdout: 'pipe', stderr: 'pipe' });
+      // ---> FIX: Inject aggressive SSH timeout to prevent 2.5 minute hangs <---
+      const mergedEnv = { ...env, GIT_SSH_COMMAND: 'ssh -o ConnectTimeout=5 -o BatchMode=yes' };
+      const proc = Bun.spawn(cmd.split(' '), { cwd, env: mergedEnv, stdout: 'pipe', stderr: 'pipe' });
+      
       proc.exited.then(async () => {
         if (proc.exitCode === 0) resolve();
         else {
@@ -500,10 +503,20 @@ export class E2EOrchestrator {
     });
   }
 
-  private runAsyncOutput(cmd: string, cwd: string): Promise<string> {
+  private runAsyncOutput(cmd: string, cwd: string, timeoutMs = 10000): Promise<string> {
     return new Promise((resolve, reject) => {
-      const proc = Bun.spawn(cmd.split(' '), { cwd, stdout: 'pipe', stderr: 'pipe' });
+      // ---> FIX: SSH Timeout + JavaScript fallback timeout for ls-remote <---
+      const mergedEnv = { ...process.env, GIT_SSH_COMMAND: 'ssh -o ConnectTimeout=5 -o BatchMode=yes' };
+      const proc = Bun.spawn(cmd.split(' '), { cwd, env: mergedEnv, stdout: 'pipe', stderr: 'pipe' });
+
+      // Fallback: If git hangs on an HTTP fetch instead of SSH, kill it after 10s
+      const timer = setTimeout(() => {
+        proc.kill(9);
+        reject(new Error(`Command timed out after ${timeoutMs}ms: ${cmd}`));
+      }, timeoutMs);
+
       proc.exited.then(async () => {
+        clearTimeout(timer);
         const out = await new Response(proc.stdout).text();
         if (proc.exitCode === 0) resolve(out.trim());
         else reject(new Error(`Command failed: ${cmd}`));
@@ -684,7 +697,10 @@ export class E2EOrchestrator {
           repoPath: string;
           targetDir: string;
           target: string;
+          branchName: string;
+          isExplicitRemote: boolean;
           needsFetch: boolean;
+          hasRemote: boolean; // <-- ADD THIS
         }>
       >();
 
@@ -772,6 +788,7 @@ export class E2EOrchestrator {
                         branchName,
                         isExplicitRemote,
                         needsFetch,
+                        hasRemote: !!remoteSha, // <-- ADD THIS
                       };
                     })
                     .catch(() => ({
@@ -782,6 +799,7 @@ export class E2EOrchestrator {
                       branchName,
                       isExplicitRemote,
                       needsFetch: !headMatchesTarget,
+                      hasRemote: false, // <-- ADD THIS
                     })),
                 );
               }
@@ -813,22 +831,20 @@ export class E2EOrchestrator {
               );
             } else {
               await this.runAsync(`git worktree add ${targetDir} ${branchName}`, repoPath).catch(
-                async (err) => {
-                  if (err.message.includes('already checked out')) {
-                    console.log(
-                      `   -> ⚠️  ${repoName}: '${branchName}' is checked out in the main repo. Detaching HEAD to avoid conflicts...`,
-                    );
-                    await this.runAsync(
-                      `git worktree add --detach ${targetDir} ${branchName}`,
-                      repoPath,
-                    );
-                  } else {
+                async () => {
+                  // Try detaching in case it's checked out in another worktree
+                  await this.runAsync(
+                    `git worktree add --detach ${targetDir} ${branchName}`,
+                    repoPath,
+                  ).catch(async (err2) => {
                     // Fallback: create local branch tracking remote if it truly doesn't exist
                     await this.runAsync(
                       `git worktree add -b ${branchName} ${targetDir} origin/${branchName}`,
                       repoPath,
-                    );
-                  }
+                    ).catch(() => {
+                      throw err2; // Throw original error so we see why it failed
+                    });
+                  });
                 },
               );
             }
@@ -843,7 +859,7 @@ export class E2EOrchestrator {
 
         if (stale.length > 0) {
           await Promise.all(
-            stale.map(async ({ repoName, targetDir, target, branchName, isExplicitRemote }) => {
+            stale.map(async ({ repoName, targetDir, target, branchName, isExplicitRemote, hasRemote }) => {
               console.log(`   -> ${repoName} @ ${target}: syncing with remote...`);
               await this.runAsync('git fetch --all --tags', targetDir);
               try {
@@ -852,22 +868,37 @@ export class E2EOrchestrator {
                 } else {
                   // Try to checkout the local branch
                   await this.runAsync(`git checkout ${branchName}`, targetDir).catch(async () => {
-                    await this.runAsync(
-                      `git checkout -b ${branchName} origin/${branchName}`,
-                      targetDir,
-                    );
+                    // If it failed, try detaching (handles locked branch in another worktree)
+                    await this.runAsync(`git checkout --detach ${branchName}`, targetDir).catch(async (err2: any) => {
+                      if (hasRemote) {
+                        await this.runAsync(`git checkout -b ${branchName} origin/${branchName}`, targetDir);
+                      } else {
+                        throw err2;
+                      }
+                    });
                   });
-                  // Attempt safe fast-forward
-                  await this.runAsync(`git pull --ff-only origin ${branchName}`, targetDir).catch(
-                    () => {
-                      console.log(
-                        `   -> ⚠️  ${repoName}: Local branch '${branchName}' has unpushed commits or diverged. Keeping local state.`,
-                      );
-                    },
-                  );
+                  
+                  if (hasRemote) {
+                    // Attempt safe fast-forward
+                    await this.runAsync(`git pull --ff-only origin ${branchName}`, targetDir).catch(
+                      () => {
+                        console.log(
+                          `   -> ⚠️  ${repoName}: Local branch '${branchName}' has unpushed commits or diverged. Keeping local state.`,
+                        );
+                      },
+                    );
+                  } else {
+                    console.log(`   -> ℹ️  ${repoName}: Local branch '${branchName}' is unpushed. Using local state.`);
+                  }
                 }
-              } catch (e) {
-                console.log(`   -> ❌ ${repoName}: Failed to checkout ${target}`);
+              } catch (e: any) {
+                // Extract the real Git error message so it's not hidden
+                const gitMsg = e.message.split('\n').slice(1).join(' ').trim() || e.message.split('\n')[0];
+                console.log(`   -> ❌ ${repoName}: Failed to checkout ${target} (Git: ${gitMsg})`);
+                if (!hasRemote) {
+                  console.log(`   -> ℹ️  Tip: Make sure the branch is spelled correctly and exists in the main repo.`);
+                }
+                throw e; // Halt the orchestrator so it doesn't run tests on the wrong code
               }
             }),
           );
@@ -1094,6 +1125,11 @@ export class E2EOrchestrator {
               if (hostP && !isNaN(hostP)) {
                 const img = String(svc.image || '').toLowerCase();
                 const sName = svcName.toLowerCase();
+                
+                // ---> FIX: If it is Redis/Valkey, completely ignore it <---
+                const isRedis = img.includes('redis') || img.includes('valkey') || sName.includes('redis');
+                if (isRedis) continue; 
+
                 infraPorts.push({
                   port: hostP,
                   serviceName: svcName,
@@ -1102,7 +1138,7 @@ export class E2EOrchestrator {
                   isMongo: img.includes('mongo') || sName.includes('mongo'),
                   isPostgres: img.includes('postgres') || img.includes('timescale') || sName.includes('db'),
                   isKafka: img.includes('kafka') || img.includes('bitnami/kafka') || sName.includes('queue'),
-                  isRedis: img.includes('redis') || img.includes('valkey') || sName.includes('redis'),
+                  isRedis: false
                 });
               }
             }
@@ -1113,53 +1149,62 @@ export class E2EOrchestrator {
 
     const portsArray = infraPorts.map(i => i.port).sort((a, b) => a - b);
     if (portsArray.length > 0) {
-      console.log(`⏳ Waiting for Ports: [${[...new Set(portsArray)].join(', ')}]...`);
+      console.log(`⏳ Waiting for Ports: [${[...new Set(portsArray)].join(', ')}] (Concurrently)...`);
     }
 
-    for (const info of infraPorts) {
-      const { port, serviceName, dir, isMongo, isPostgres, isKafka, isRedis } = info;
-      let ready = false;
-      
-      for (let i = 0; i < 30; i++) {
-        try {
-          execSync(`nc -z -w 1 127.0.0.1 ${port}`, { stdio: 'ignore' });
-
-          // Securely fetch exact container ID belonging to this specific compose project
-          const containerId = execSync(`docker compose ps -q ${serviceName} | head -1`, { cwd: dir, encoding: 'utf-8' }).trim();
-          
-          if (containerId) {
-            if (isPostgres) {
-              execSync(`docker exec ${containerId} pg_isready -U postgres`, { stdio: 'ignore' });
-            }
-
-            if (isMongo) {
-              execSync(`docker exec ${containerId} sh -c 'mongosh -u root -p root --authenticationDatabase admin --quiet --eval "db.adminCommand(\\"ping\\")"'`, { stdio: 'ignore' });
-            }
-
-            if (isKafka) {
-              execSync(`docker exec ${containerId} kafka-topics.sh --bootstrap-server localhost:9092 --list`, { stdio: 'ignore' });
-            }
-
-            if (isRedis) {
-              // Gracefully handle cluster vs standalone AND dynamic internal ports
-              // Uses standard grep to prevent Alpine SIGPIPE early-exit crashes
-              execSync(
-                `docker exec ${containerId} sh -c 'cli="redis-cli"; valkey-cli -v >/dev/null 2>&1 && cli="valkey-cli"; p=""; $cli ping >/dev/null 2>&1 || p="-p ${port}"; if $cli $p info cluster 2>/dev/null | grep "cluster_enabled:1" >/dev/null; then $cli $p cluster info 2>/dev/null | grep "cluster_state:ok" >/dev/null; else $cli $p ping >/dev/null 2>&1; fi'`,
-                { stdio: 'ignore' }
-              );
-            }
+    // Helper to run shell commands asynchronously without blocking the event loop
+    const execAsync = (cmd: string, cwd?: string): Promise<string> => {
+      return new Promise((resolve, reject) => {
+        const proc = Bun.spawn(['sh', '-c', cmd], { cwd, stdout: 'pipe', stderr: 'ignore' });
+        proc.exited.then(async () => {
+          if (proc.exitCode === 0) {
+            const out = await new Response(proc.stdout).text();
+            resolve(out.trim());
+          } else {
+            reject(new Error('Command failed'));
           }
+        });
+      });
+    };
 
-          ready = true;
-          break;
-        } catch {
-          await new Promise((r) => setTimeout(r, 1000));
+    // Run all probes in parallel
+    await Promise.all(
+      infraPorts.map(async (info) => {
+        const { port, serviceName, dir, isMongo, isPostgres, isKafka } = info;
+        let ready = false;
+        
+        for (let i = 0; i < 30; i++) {
+          try {
+            // 1. Check TCP Port
+            await execAsync(`nc -z -w 1 127.0.0.1 ${port}`);
+
+            // 2. Fetch Container ID
+            const containerId = await execAsync(`docker compose ps -q ${serviceName} | head -1`, dir);
+            
+            // 3. Deep Probes
+            if (containerId) {
+              if (isPostgres) {
+                await execAsync(`docker exec -w / ${containerId} pg_isready -U postgres`);
+              }
+              if (isMongo) {
+                await execAsync(`docker exec -w / ${containerId} sh -c 'mongosh -u root -p root --authenticationDatabase admin --quiet --eval "db.adminCommand(\\"ping\\")"'`);
+              }
+              if (isKafka) {
+                await execAsync(`docker exec -w / ${containerId} kafka-topics.sh --bootstrap-server localhost:9092 --list`);
+              }
+            }
+
+            ready = true;
+            break;
+          } catch {
+            await new Promise((r) => setTimeout(r, 1000));
+          }
         }
-      }
-      
-      if (ready) console.log(`   ✅ Port ${port} (${serviceName}) is fully ready.`);
-      else console.warn(`   ⚠️  Port ${port} (${serviceName}) still warming up, proceeding with caution...`);
-    }
+        
+        if (ready) console.log(`   ✅ Port ${port} (${serviceName}) is fully ready.`);
+        else console.warn(`   ⚠️  Port ${port} (${serviceName}) still warming up, proceeding with caution...`);
+      })
+    );
 
     this._startDockerLogCapture();
   }
@@ -1394,7 +1439,8 @@ export class E2EOrchestrator {
 
     // Pre-resolve readyMap for unchanged services (still running).
     for (const [name] of nativeServices) {
-      if (!needsRestart.has(name)) {
+      // ---> FIX: Changed needsRestart to this._needsRestart <---
+      if (!this._needsRestart.has(name)) {
         readyMap.get(name)!.resolve();
       }
     }
@@ -1404,7 +1450,8 @@ export class E2EOrchestrator {
     const launchTasks = nativeServices.map(([name, svc]) =>
       (async () => {
         // ---> SURGICAL LAUNCH <---
-        if (!needsRestart.has(name)) {
+        // ---> FIX: Changed needsRestart to this._needsRestart <---
+        if (!this._needsRestart.has(name)) {
           console.log(`   ⚡ ${name}: unchanged, staying warm`);
           return;
         }
@@ -2079,88 +2126,119 @@ export class E2EOrchestrator {
       if (flush && redisPrefix) toFlushRedis.add(redisPrefix);
     }
 
-    if (toFlushRedis.size > 0) {
-      console.log('\n🧹 Flushing Redis namespaces...');
+    if (toFlushRedis.size === 0) return;
+    
+    console.log('\n🧹 Flushing Redis namespaces...');
+    
+    // Dynamically find Redis containers from the deployed compose files
+    const redisContainers = new Set<string>();
+    const seenRepoPaths = new Set<string>();
+    
+    for (const [repoName, repo] of Object.entries(orchestratorCfg.repos)) {
+      const repoPath = path.resolve(repo.repoPath);
+      if (seenRepoPaths.has(repoPath)) continue;
+      seenRepoPaths.add(repoPath);
+      
+      const dir = path.join(this.worktreeBase, repoName);
+      const composeFile = path.join(dir, 'docker-compose.yml');
+      if (!fs.existsSync(composeFile)) continue;
+      
       try {
-        const containerIds = execSync(`docker ps -q -f "name=redis" -f "name=valkey"`).toString().trim().split('\n').filter(Boolean);
-        if (containerIds.length > 0) {
-          
-          for (const prefix of toFlushRedis) {
-            console.log(`   -> Scanning Redis instance(s) for prefix: ${prefix}:*`);
-
-            // This script auto-detects internal ports, cluster state, and flushes correctly.
-            // It explicitly uses robust CLI detection and forces exit 0 so minor errors don't crash Node.
-            const script = `
-              cli="redis-cli"
-              valkey-cli -v >/dev/null 2>&1 && cli="valkey-cli"
-              
-              # Auto-detect working port (try default 6379, then fallback to common custom ports)
-              p=""
-              if $cli ping >/dev/null 2>&1; then p=""
-              elif $cli -p 6000 ping >/dev/null 2>&1; then p="-p 6000"
-              elif $cli -p 6001 ping >/dev/null 2>&1; then p="-p 6001"
-              elif $cli -p 6380 ping >/dev/null 2>&1; then p="-p 6380"
-              fi
-              
-              total=0
-              
-              # Use standard grep to avoid SIGPIPE early-exit crashes in Alpine
-              if $cli $p info cluster 2>/dev/null | grep "cluster_enabled:1" >/dev/null; then
-                # --- CLUSTER MODE ---
-                for master in $($cli $p cluster nodes 2>/dev/null | awk '/master/ {print $2}' | cut -d@ -f1); do
-                  host=$(echo $master | cut -d: -f1)
-                  port=$(echo $master | cut -d: -f2)
-                  keys=$($cli -h $host -p $port --scan --pattern "${prefix}:*" 2>/dev/null)
-                  if [ -n "$keys" ]; then
-                    for key in $keys; do
-                      echo "      🗑️  Found: $key"
-                      total=$((total + 1))
-                    done
-                    echo "$keys" | xargs -n 50 $cli -h $host -p $port DEL >/dev/null 2>&1
-                  fi
-                done
-              else
-                # --- STANDALONE MODE ---
-                keys=$($cli $p --scan --pattern "${prefix}:*" 2>/dev/null)
-                if [ -n "$keys" ]; then
-                  for key in $keys; do
-                    echo "      🗑️  Found: $key"
-                    total=$((total + 1))
-                  done
-                  echo "$keys" | xargs -n 50 $cli $p DEL >/dev/null 2>&1
-                fi
-              fi
-              
-              if [ "$total" -gt 0 ]; then
-                echo "   ✅ Successfully deleted $total keys for prefix ${prefix}:*"
-              else
-                echo "   ℹ️  No existing keys found for prefix ${prefix}:*"
-              fi
-              
-              exit 0
-            `;
-
-            const primaryContainer = containerIds[0];
-            try {
-              const output = execSync(`docker exec -i ${primaryContainer} sh`, {
-                input: script,
-                stdio: ['pipe', 'pipe', 'pipe'],
-              });
-              console.log(output.toString().replace(/\n$/, ''));
-            } catch (e: any) {
-              console.warn(`   ⚠️  Failed to clear Redis prefix ${prefix}:*`);
-              // Extract stdout as well, since shell script errors often dump to stdout instead of stderr
-              const errOut = e.stdout ? e.stdout.toString().trim() : '';
-              const errMsg = e.stderr ? e.stderr.toString().trim() : '';
-              console.warn(`      Error: ${errMsg || errOut || e.message || 'Unknown error'}`);
+        const doc = parseYaml(fs.readFileSync(composeFile, 'utf-8')) as any;
+        if (doc?.services) {
+          for (const [svcName, svc] of Object.entries<any>(doc.services)) {
+            const img = String(svc.image || '').toLowerCase();
+            if (img.includes('redis') || img.includes('valkey') || svcName.toLowerCase().includes('redis')) {
+              const cid = execSync(`docker compose ps -q ${svcName} | head -1`, { cwd: dir, encoding: 'utf-8' }).trim();
+              if (cid) redisContainers.add(cid);
             }
           }
         }
-      } catch (e: any) {
-        console.warn('   ⚠️  Failed to execute Redis flush.');
-        const errMsg = e.stderr ? e.stderr.toString().trim() : '';
-        console.warn(`      Error: ${errMsg || e.message || 'Failed to list containers'}`);
+      } catch (e) {}
+    }
+
+    if (redisContainers.size === 0) {
+      console.warn('   ⚠️  No Redis/Valkey containers found in the active infrastructure.');
+      return;
+    }
+
+    for (const prefix of toFlushRedis) {
+      console.log(`   -> Scanning Redis instance(s) for prefix: ${prefix}:*`);
+      
+      const script = `#!/bin/sh
+c="redis-cli"
+valkey-cli -v >/dev/null 2>&1 && c="valkey-cli"
+
+# Auto-detect working port (try default 6379, then fallback to common custom ports)
+p=""
+if $c ping >/dev/null 2>&1; then p=""
+elif $c -p 6000 ping >/dev/null 2>&1; then p="-p 6000"
+elif $c -p 6380 ping >/dev/null 2>&1; then p="-p 6380"
+fi
+
+# ---> FIX: Force Valkey/Redis to ignore disk write errors during E2E tests <---
+$c $p config set stop-writes-on-bgsave-error no >/dev/null 2>&1
+
+total=0
+is_cluster=$($c $p info cluster 2>/dev/null | grep -c "cluster_enabled:1" || echo "0")
+
+if [ "$is_cluster" -gt 0 ]; then
+  # --- CLUSTER MODE ---
+  for master in $($c $p cluster nodes 2>/dev/null | awk '/master/ {print $2}' | cut -d@ -f1); do
+    host=$(echo $master | cut -d: -f1)
+    port=$(echo $master | cut -d: -f2)
+    
+    # Also disable the block on each specific master node
+    $c -h $host -p $port config set stop-writes-on-bgsave-error no >/dev/null 2>&1
+    
+    keys=$($c -h $host -p $port --scan --pattern "${prefix}:*" 2>/dev/null)
+    if [ -n "$keys" ]; then
+      for key in $keys; do
+        echo "      🗑️  Found: $key"
+        total=$((total + 1))
+      done
+      echo "$keys" | xargs -n 50 $c -h $host -p $port DEL >/dev/null 2>&1
+    fi
+  done
+else
+  # --- STANDALONE MODE ---
+  keys=$($c $p --scan --pattern "${prefix}:*" 2>/dev/null)
+  if [ -n "$keys" ]; then
+    for key in $keys; do
+      echo "      🗑️  Found: $key"
+      total=$((total + 1))
+    done
+    echo "$keys" | xargs -n 50 $c $p DEL >/dev/null 2>&1
+  fi
+fi
+
+if [ "$total" -gt 0 ]; then
+  echo "   ✅ Successfully deleted $total keys for prefix ${prefix}:*"
+else
+  echo "   ℹ️  No existing keys found for prefix ${prefix}:*"
+fi
+exit 0
+`;
+
+      const scriptPath = path.join(this.worktreeBase, `flush-${Date.now()}.sh`);
+      fs.writeFileSync(scriptPath, script);
+
+      for (const cid of redisContainers) {
+        try {
+          execSync(`docker cp ${scriptPath} ${cid}:/tmp/flush.sh`, { stdio: 'ignore' });
+          
+          // ---> FIX: Added -w /tmp to prevent the OCI Breakout error <---
+          const output = execSync(`docker exec -w /tmp ${cid} sh /tmp/flush.sh`);
+          
+          const text = output.toString().trim();
+          if (text) console.log(text);
+        } catch (e: any) {
+          console.warn(`   ⚠️  Failed to clear Redis prefix ${prefix}:* on container ${cid.slice(0,8)}`);
+          const errMsg = e.stderr?.toString().trim() || e.stdout?.toString().trim() || e.message;
+          console.warn(`      Error: ${errMsg}`);
+        }
       }
+      try { fs.unlinkSync(scriptPath); } catch {}
     }
   }
 

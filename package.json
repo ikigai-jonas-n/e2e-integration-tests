@@ -9,6 +9,7 @@
     "test:fast": "bash src/scripts/run-tests.sh --timeout 5000",
     "setup:env": "bun run src/scripts/dev-services.ts",
     "reset": "bash src/scripts/reset.sh",
+    "reset:hard": "bash src/scripts/reset.sh --hard",
     "lint": "bun run type:check && bun run prettier:check && bun run lint:code",
     "lint:fix": "bun run prettier:fix && bun run lint:code --fix",
     "type:check": "tsc --noEmit",

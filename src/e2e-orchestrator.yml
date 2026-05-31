@@ -36,7 +36,7 @@ repos:
 
   slot-game-server:
     repoPath: "../slot-game-server"
-    target: "sprint/1.12/base"
+    target: "sprint/1.15/base"
 
   # remote-game-server — one worktree per version
   # services sharing the same worktree key share a single build (npm install + build runs once)
@@ -61,7 +61,7 @@ repos:
 
   remote-game-server-billing:
     repoPath: "../remote-game-server"
-    target: "1.14.1"                        # billing
+    target: "origin/main"                        # billing
     alwaysRedoMigration: false
     # uses billing env by default — has all DB credentials
     # DB_NAME=slot, MONGO_NAME=rgs (defaults from .env.billing.example)
