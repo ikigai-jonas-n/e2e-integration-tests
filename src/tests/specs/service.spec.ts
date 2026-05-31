@@ -22,7 +22,9 @@ export function runServiceTests() {
   });
 
   it('Billing /v2/service/sync-games has LGS-004 with currencies', async () => {
-    const res = await api.get(`${BILLING_URL}/v2/service/sync-games`, { headers: SERVICE_SIGNATURE });
+    const res = await api.get(`${BILLING_URL}/v2/service/sync-games`, {
+      headers: SERVICE_SIGNATURE,
+    });
     expect(res.status).toBe(200);
     const games = res.data?.data?.games ?? res.data?.data;
     const game = games?.find((g: any) => g.code === 'LGS-004');

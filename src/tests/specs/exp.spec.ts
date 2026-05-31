@@ -18,7 +18,12 @@ export function runExpTests() {
         gameCode: 'LGS-004',
         lang: 'en',
         country: 'GB',
-gameSetting: { rtpConfigCode: TARGET_RTP_CODE, isGeoBlocking: true, jurisdictionCode: 'slotJD' },        mode: 'real',
+        gameSetting: {
+          rtpConfigCode: TARGET_RTP_CODE,
+          isGeoBlocking: true,
+          jurisdictionCode: 'slotJD',
+        },
+        mode: 'real',
         operator: 'QARealGameOperator',
         brand: 'QARealGameBrand',
         playerId: PLAYER_ID,

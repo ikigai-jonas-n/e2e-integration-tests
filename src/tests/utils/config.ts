@@ -8,9 +8,7 @@ const composed = parseYaml(
 ) as { services: Record<string, { ports?: string[] }> };
 
 // Read orchestrator config
-const orchCfg = parseYaml(
-  readFileSync(path.resolve('./src/e2e-orchestrator.yml'), 'utf-8'),
-) as any;
+const orchCfg = parseYaml(readFileSync(path.resolve('./src/e2e-orchestrator.yml'), 'utf-8')) as any;
 
 export function instanceBase(name: string): string {
   const svc = composed.services?.[name];

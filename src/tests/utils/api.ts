@@ -80,7 +80,9 @@ export const api = {
     if (!token) throw new Error('Failed to generate AM token');
 
     // Zero-side-effect validation: Get current game state, then patch it to the EXACT SAME state
-    const syncRes = await api.get(`${BILLING_URL}/v2/service/sync-games`, { headers: SERVICE_SIGNATURE });
+    const syncRes = await api.get(`${BILLING_URL}/v2/service/sync-games`, {
+      headers: SERVICE_SIGNATURE,
+    });
     const games = syncRes.data?.data?.games ?? syncRes.data?.data;
     const targetGame = games?.find((g: any) => g.code === TARGET_GAME_CODE);
     const currentState = targetGame?.enabled ?? true;
@@ -101,7 +103,7 @@ export const api = {
   // --- UPDATE THIS (Make amToken optional) ---
   propagateConfig: async (amToken?: string) => {
     const token = amToken ?? (await api.getAmToken()); // Fetch fresh if not provided
-    
+
     const res = await api.get(`${BILLING_URL}/v2/service/games`, { headers: SERVICE_SIGNATURE });
     const games = res.data?.data?.games ?? res.data?.data;
 
@@ -140,15 +142,19 @@ export const api = {
     // Wait for the Game Node's 60-second cron to sync the state into memory
     await waitForCondition(async () => {
       const res = await api.get(`${GAME_URL}/v2/service/games`, { headers: SERVICE_SIGNATURE });
-      
+
       // Ensure we handle both potential formats
-      const games = Array.isArray(res.data?.data?.games) 
-        ? res.data.data.games 
-        : (Array.isArray(res.data?.data) ? res.data.data : []);
+      const games = Array.isArray(res.data?.data?.games)
+        ? res.data.data.games
+        : Array.isArray(res.data?.data)
+          ? res.data.data
+          : [];
 
       const targetGame = games.find((g: any) => g.code === gameCode);
-      
-      console.log(`[resetGameState] ${gameCode} found: ${!!targetGame}, enabled: ${targetGame?.enabled}`);
+
+      console.log(
+        `[resetGameState] ${gameCode} found: ${!!targetGame}, enabled: ${targetGame?.enabled}`,
+      );
       return targetGame?.enabled === true;
     }, 90000);
   },

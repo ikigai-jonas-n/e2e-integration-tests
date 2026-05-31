@@ -51,7 +51,9 @@ export function runMaintenanceFlowTests() {
 
   // @requires billing >= 1.8.0
   it.if(atLeast('billing', '1.8.0'))('Step 3: Billing confirms isMaintenance = true', async () => {
-    const res = await api.get(`${BILLING_URL}/v2/service/sync-games`, { headers: SERVICE_SIGNATURE });
+    const res = await api.get(`${BILLING_URL}/v2/service/sync-games`, {
+      headers: SERVICE_SIGNATURE,
+    });
     expect(res.status).toBe(200);
 
     const games = res.data?.data?.games ?? res.data?.data;
@@ -75,7 +77,9 @@ export function runMaintenanceFlowTests() {
 
   // @requires billing >= 1.8.0
   it.if(atLeast('billing', '1.8.0'))('Step 5: Billing confirms isMaintenance = false', async () => {
-    const res = await api.get(`${BILLING_URL}/v2/service/sync-games`, { headers: SERVICE_SIGNATURE });
+    const res = await api.get(`${BILLING_URL}/v2/service/sync-games`, {
+      headers: SERVICE_SIGNATURE,
+    });
     expect(res.status).toBe(200);
 
     const games = res.data?.data?.games ?? res.data?.data;

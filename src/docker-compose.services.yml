@@ -137,10 +137,15 @@ services:
         CORE_SLOT_RGS_SERVICE_URL: "http://127.0.0.1:8080"
       ports:
         - "7001:7001"
-      # Waits for billing healthcheck before spawning — replaces `while ! curl` bash hack
       depends_on:
         billing:
           condition: service_healthy
+      # ---> ADD THIS BLOCK <---
+      healthcheck:
+        test: ["CMD", "curl", "-sf", "http://127.0.0.1:7001/v2/service/healthcheck"]
+        interval: 2s
+        timeout: 3s
+        retries: 30
 
   game-activity:
     x-repo: remote-game-server-no-db     # main branch — triggers build for jobs too

@@ -247,7 +247,10 @@ interface E2EReadyState {
 export class E2EOrchestrator {
   private activeProcesses: any[] = [];
   private streamControllers: AbortController[] = []; // <-- ADD THIS
+  private activeStreams: fs.WriteStream[] = []; // <-- ADD THIS
   private _changedRepos = new Set<string>();
+  private _deadServices = new Set<string>();
+  private _needsRestart = new Set<string>(); // <-- ADD THIS
   private _partialWarmStart = false; // services healthy but some repos changed
   private worktreeBase = path.resolve(orchestratorCfg.global.worktreeBasePath);
   private npmCacheDir = path.resolve('./.e2e-npm-cache');
@@ -286,12 +289,17 @@ export class E2EOrchestrator {
       this._masterStream = fs.createWriteStream(path.join(this.logDir, '_master.log'), {
         flags: 'a',
       });
+      this.activeStreams.push(this._masterStream); // <-- ADD THIS
     }
     return this._masterStream;
   }
 
   private openServiceStream(name: string, port: number): ReturnType<typeof fs.createWriteStream> {
-    return fs.createWriteStream(path.join(this.logDir, `${name}-${port}.log`), { flags: 'a' });
+    const stream = fs.createWriteStream(path.join(this.logDir, `${name}-${port}.log`), {
+      flags: 'a',
+    });
+    this.activeStreams.push(stream); // <-- ADD THIS
+    return stream;
   }
 
   private get network(): string | null {
@@ -324,9 +332,15 @@ export class E2EOrchestrator {
   private getBuildKey(dir: string): { commit: string; dirty: string } | null {
     try {
       const commit = execSync('git rev-parse HEAD', { cwd: dir }).toString().trim();
-      const diff = execSync('git diff HEAD -- ":(exclude)*docker-compose*" ":(exclude)*.env*"', {
-        cwd: dir,
-      }).toString();
+
+      // FIX: Added aggressive exclusions for build artifacts, node_modules, and logs.
+      // This prevents IDEs or linters from triggering a false-positive "dirty" state
+      // if they touch ignored files.
+      const diffCmd =
+        'git diff HEAD -- ":(exclude)*docker-compose*" ":(exclude)*.env*" ":(exclude)node_modules/*" ":(exclude)build/*" ":(exclude)logs/*" ":(exclude).e2e-state.json"';
+
+      const diff = execSync(diffCmd, { cwd: dir }).toString();
+
       let h = 5381;
       for (let i = 0; i < diff.length; i++) h = ((h << 5) + h) ^ diff.charCodeAt(i);
       return { commit, dirty: (h >>> 0).toString(16) };
@@ -380,26 +394,31 @@ export class E2EOrchestrator {
   private async detectWarmStart(): Promise<void> {
     console.log('\n📊 Startup Analysis:');
 
-    const healthUrls = Object.values(composeServices)
-      .map((s) => healthCheckUrl(s))
-      .filter(Boolean) as string[];
-
-    let servicesHealthy = false;
-    if (healthUrls.length > 0) {
+    // Granularly check which services are dead
+    const healthPromises = Object.entries(composeServices).map(async ([name, svc]) => {
+      const url = healthCheckUrl(svc);
+      if (!url) return { name, healthy: true };
       try {
-        await Promise.all(healthUrls.map((url) => axios.get(url, { timeout: 1500 })));
-        servicesHealthy = true;
-        console.log(`   Services:  ✅ all ${healthUrls.length} health checks passed`);
+        await axios.get(url, { timeout: 1500 });
+        return { name, healthy: true };
       } catch {
-        console.log('   Services:  ❌ one or more health checks failed → full startup required');
+        return { name, healthy: false };
       }
-    } else {
-      console.log('   Services:  ⚠️  no health checks configured');
+    });
+
+    const healthResults = await Promise.all(healthPromises);
+    for (const r of healthResults) {
+      if (!r.healthy) this._deadServices.add(r.name);
     }
 
-    // Build-cache checks use `git diff HEAD` (blocking I/O). Run them in parallel
-    // across unique repos so N repos cost max(1_repo_time) instead of sum.
-    const uniqueRepos = new Map<string, string>(); // repo → svcDir
+    if (this._deadServices.size === 0) {
+      console.log(`   Services:  ✅ all health checks passed`);
+    } else {
+      console.log(`   Services:  ❌ dead services detected: [${[...this._deadServices].join(', ')}]`);
+    }
+
+    // Cache checks...
+    const uniqueRepos = new Map<string, string>();
     for (const svc of Object.values(composeServices)) {
       const repo = svc['x-repo'];
       if (!repo || uniqueRepos.has(repo)) continue;
@@ -408,9 +427,7 @@ export class E2EOrchestrator {
     }
     const cacheResults = await Promise.all(
       [...uniqueRepos.entries()].map(async ([repo, svcDir]) => ({
-        repo,
-        svcDir,
-        status: await new Promise<string>((res) => res(this.buildCacheStatus(svcDir))),
+        repo, svcDir, status: await new Promise<string>((res) => res(this.buildCacheStatus(svcDir))),
       })),
     );
     let allCached = true;
@@ -418,36 +435,32 @@ export class E2EOrchestrator {
       const cached = status === 'up-to-date';
       if (!cached) {
         allCached = false;
-        this._changedRepos.add(repo); // <-- ADD THIS
+        this._changedRepos.add(repo);
       }
       console.log(`   ${repo.padEnd(24)} ${cached ? '⚡ cached' : `🔄 ${status}`}`);
     }
 
-    this._warmStart = servicesHealthy && allCached;
-    this._partialWarmStart = servicesHealthy && !allCached;
+    this._warmStart = this._deadServices.size === 0 && allCached;
+    this._partialWarmStart = !this._warmStart; 
 
-    const v = this.verbose;
-    const note =
-      v === true
-        ? '(verbose=true: service logs → terminal+log)'
-        : v === 'errors'
-          ? '(verbose="errors": stderr→terminal, stdout→log)'
-          : '(verbose=false: service logs → log file only)';
-    if (this._warmStart) {
-      console.log(
-        `\n⚡ Mode: WARM START — skipping docker / migrations / build / restart. ${note}\n`,
-      );
-    } else if (this._partialWarmStart) {
-      const changedList = [...this._changedRepos].join(', ');
-      console.log(
-        `\n⚡ Mode: PARTIAL WARM START — only [${changedList}] changed, selectively rebuilding. ${note}\n`,
-      );
-    } else {
-      const reasons = [
-        ...(!servicesHealthy ? ['services not healthy'] : []),
-        ...(!allCached ? ['code changed'] : []),
-      ];
-      console.log(`\n🚀 Mode: COLD START — reason: ${reasons.join(', ')}. ${note}\n`);
+    // ---> NEW: Compute exactly what needs restarting here <---
+    this._needsRestart = new Set([...this._deadServices]);
+    for (const [name, svc] of Object.entries(composeServices)) {
+      if (svc['x-repo'] && this._changedRepos.has(svc['x-repo'])) {
+        this._needsRestart.add(name);
+      }
+    }
+    let changed = true;
+    while (changed) {
+      changed = false;
+      for (const [name, svc] of Object.entries(composeServices)) {
+        if (this._needsRestart.has(name)) continue;
+        // Transitive: If a dependency restarts, we must restart too
+        if (dependsOn(svc).some((d) => this._needsRestart.has(d))) {
+          this._needsRestart.add(name);
+          changed = true;
+        }
+      }
     }
   }
 
@@ -706,21 +719,59 @@ export class E2EOrchestrator {
                 await this.runAsync(`git checkout --detach ${repo.target}`, targetDir);
               }
             } else {
-              // Branch: report optimistically based on local, fire background check.
-              const lsKey = `${repoPath}::${repo.target}`;
+              // ── Intuitiveness & Customizability: Local vs Remote explicit tracking ──
+              const isExplicitRemote = repo.target.startsWith('origin/');
+              const branchName = isExplicitRemote ? repo.target.substring(7) : repo.target;
+
+              const currentBranch = await this.runAsyncOutput(
+                'git rev-parse --abbrev-ref HEAD',
+                targetDir,
+              ).catch(() => '');
+              const headMatchesTarget = isExplicitRemote
+                ? currentBranch === 'HEAD' // Explicit remote should be a detached HEAD
+                : currentBranch === branchName; // Local target should be on the actual branch
+
+              const lsKey = `${repoPath}::${branchName}`;
               if (!pendingBranchChecks.has(lsKey)) {
-                // Start ls-remote immediately (background, not awaited here).
                 pendingBranchChecks.set(
                   lsKey,
-                  this.runAsyncOutput(`git ls-remote origin refs/heads/${repo.target}`, repoPath)
-                    .then((out) => {
+                  this.runAsyncOutput(`git ls-remote origin refs/heads/${branchName}`, repoPath)
+                    .then(async (out) => {
                       const remoteSha = out.split('\n')[0]?.split('\t')[0]?.trim() || null;
+                      let needsFetch = false;
+
+                      if (isExplicitRemote) {
+                        // Strict remote: if our HEAD isn't the remote SHA, fetch and detach
+                        needsFetch = !headMatchesTarget || (!!remoteSha && headSha !== remoteSha);
+                      } else {
+                        // Local first: we only need to fetch/update if we are NOT on the branch,
+                        // OR if the remote is strictly ahead of our local branch.
+                        if (!headMatchesTarget) {
+                          needsFetch = true;
+                        } else if (remoteSha && headSha !== remoteSha) {
+                          // Check if remote is ahead (can we fast-forward?)
+                          const mergeBase = await this.runAsyncOutput(
+                            `git merge-base HEAD ${remoteSha}`,
+                            targetDir,
+                          ).catch(() => null);
+                          if (mergeBase === headSha) {
+                            // Local is behind remote -> we must fetch to fast-forward
+                            needsFetch = true;
+                          } else {
+                            // Local is ahead (unpushed WIP) or diverged. Trust local!
+                            needsFetch = false;
+                          }
+                        }
+                      }
+
                       return {
                         repoName,
                         repoPath,
                         targetDir,
                         target: repo.target,
-                        needsFetch: !!remoteSha && headSha !== remoteSha,
+                        branchName,
+                        isExplicitRemote,
+                        needsFetch,
                       };
                     })
                     .catch(() => ({
@@ -728,13 +779,20 @@ export class E2EOrchestrator {
                       repoPath,
                       targetDir,
                       target: repo.target,
-                      needsFetch: false,
+                      branchName,
+                      isExplicitRemote,
+                      needsFetch: !headMatchesTarget,
                     })),
                 );
               }
-              console.log(
-                `   -> ${repoName} @ ${repo.target} ✓ (${headSha.slice(0, 8)}, verifying remote...)`,
-              );
+
+              if (headMatchesTarget) {
+                console.log(
+                  `   -> ${repoName} @ ${repo.target} ✓ (${headSha.slice(0, 8)}, verifying...)`,
+                );
+              } else {
+                console.log(`   -> ${repoName} switching to ${repo.target}...`);
+              }
             }
           } else {
             console.log(`   -> Checking out ${repoName} @ ${repo.target}...`);
@@ -743,28 +801,73 @@ export class E2EOrchestrator {
             try {
               await this.runAsync('git worktree prune', repoPath);
             } catch {}
-            await this.runAsync(`git worktree add --detach ${targetDir} ${repo.target}`, repoPath);
+
+            // Handle initial checkout based on local/remote preference
+            const isExplicitRemote = repo.target.startsWith('origin/');
+            const branchName = isExplicitRemote ? repo.target.substring(7) : repo.target;
+
+            if (isExplicitRemote) {
+              await this.runAsync(
+                `git worktree add --detach ${targetDir} origin/${branchName}`,
+                repoPath,
+              );
+            } else {
+              await this.runAsync(`git worktree add ${targetDir} ${branchName}`, repoPath).catch(
+                async (err) => {
+                  if (err.message.includes('already checked out')) {
+                    console.log(
+                      `   -> ⚠️  ${repoName}: '${branchName}' is checked out in the main repo. Detaching HEAD to avoid conflicts...`,
+                    );
+                    await this.runAsync(
+                      `git worktree add --detach ${targetDir} ${branchName}`,
+                      repoPath,
+                    );
+                  } else {
+                    // Fallback: create local branch tracking remote if it truly doesn't exist
+                    await this.runAsync(
+                      `git worktree add -b ${branchName} ${targetDir} origin/${branchName}`,
+                      repoPath,
+                    );
+                  }
+                },
+              );
+            }
           }
         }),
       );
 
-      // ── Phase 2: await branch remote checks (background since Phase 1 started) ─
-      // ls-remote has been running concurrently with Phase 1. It's likely already
-      // resolved. Any branch that needs updating is fetched here, before detectWarmStart
-      // evaluates cache freshness — so the build cache miss / warm-start invalidation
-      // happens naturally without special restart logic.
+      // ── Phase 2: await branch remote checks ──────────────────────────────────
       if (pendingBranchChecks.size > 0) {
         const results = await Promise.all([...pendingBranchChecks.values()]);
         const stale = results.filter((r) => r.needsFetch);
+
         if (stale.length > 0) {
           await Promise.all(
-            stale.map(async ({ repoName, targetDir, target }) => {
-              console.log(`   -> ${repoName} @ ${target}: remote has new commits — updating...`);
+            stale.map(async ({ repoName, targetDir, target, branchName, isExplicitRemote }) => {
+              console.log(`   -> ${repoName} @ ${target}: syncing with remote...`);
               await this.runAsync('git fetch --all --tags', targetDir);
               try {
-                await this.runAsync(`git checkout --detach origin/${target}`, targetDir);
-              } catch {
-                await this.runAsync(`git checkout --detach ${target}`, targetDir);
+                if (isExplicitRemote) {
+                  await this.runAsync(`git checkout --detach origin/${branchName}`, targetDir);
+                } else {
+                  // Try to checkout the local branch
+                  await this.runAsync(`git checkout ${branchName}`, targetDir).catch(async () => {
+                    await this.runAsync(
+                      `git checkout -b ${branchName} origin/${branchName}`,
+                      targetDir,
+                    );
+                  });
+                  // Attempt safe fast-forward
+                  await this.runAsync(`git pull --ff-only origin ${branchName}`, targetDir).catch(
+                    () => {
+                      console.log(
+                        `   -> ⚠️  ${repoName}: Local branch '${branchName}' has unpushed commits or diverged. Keeping local state.`,
+                      );
+                    },
+                  );
+                }
+              } catch (e) {
+                console.log(`   -> ❌ ${repoName}: Failed to checkout ${target}`);
               }
             }),
           );
@@ -774,16 +877,20 @@ export class E2EOrchestrator {
 
     await this.detectWarmStart();
 
-    if (!this._warmStart) {
-      const ports = this.portsToClear;
-      console.log(`🧹 Cold start: clearing stale processes on ports [${ports.join(', ')}]`);
-      // DARK MAGIC: Added -P -n to completely bypass DNS resolution timeouts in lsof
-      for (const port of ports) {
-        try {
-          execSync(
-            `lsof -P -n -i:${port} -sTCP:LISTEN | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`,
-          );
-        } catch {}
+    // ---> FIX: Only kill the ports of services we actually plan to restart <---
+    if (this._needsRestart.size > 0) {
+      const portsToKill = [...this._needsRestart]
+        .flatMap(name => composeServices[name]?.ports || [])
+        .map(p => hostPort([p]))
+        .filter(p => p !== null);
+        
+      if (portsToKill.length > 0) {
+        console.log(`🧹 Smart cleanup: clearing ports [${portsToKill.join(', ')}]`);
+        for (const port of portsToKill) {
+          try {
+            execSync(`lsof -P -n -i:${port} -sTCP:LISTEN | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`);
+          } catch {}
+        }
       }
     }
   }
@@ -948,14 +1055,16 @@ export class E2EOrchestrator {
           this.writeComposeOverride(dir, this.network, overrides);
         }
 
-        // ADDED: --force-recreate to clear out broken container states
-        await this.runAsync('docker compose up -d --force-recreate', dir);
+        // ---> OPTIMIZATION 1: Remove --force-recreate <---
+        // This allows Docker to instantly skip untouched containers
+        await this.runAsync('docker compose up -d', dir);
       }),
     );
 
     // Map the internal ports to your actual LOCAL ports defined in your .env/compose
+    // ---> FIX: Add 6000 (Redis) to the wait list <---
     console.log('⏳ Waiting for Databases and Kafka to accept connections...');
-    const portsToWait = [5437, 27017, 9093];
+    const portsToWait = [5437, 27017, 9093, 6000];
 
     for (const port of portsToWait) {
       let ready = false;
@@ -965,9 +1074,22 @@ export class E2EOrchestrator {
 
           // Deeper readiness probes — port open ≠ service ready.
           if (port === 5437) {
-            execSync(`docker exec $(docker ps -q -f "name=db-1") pg_isready -U postgres`, {
-              stdio: 'ignore',
-            });
+            execSync(`docker exec $(docker ps -q -f "name=db-1") pg_isready -U postgres`, { stdio: 'ignore' });
+          }
+
+          // ---> ADD THIS MONGO PROBE <---
+          if (port === 27017) {
+            const mongoContainer = execSync(
+              "docker ps -q -f 'name=mongo' | head -1",
+              { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }
+            ).trim();
+            if (mongoContainer) {
+              // Wait until mongosh can actually authenticate and ping the admin DB
+              execSync(
+                `docker exec ${mongoContainer} sh -c 'mongosh -u root -p root --authenticationDatabase admin --quiet --eval "db.adminCommand(\\"ping\\")"'`,
+                { stdio: 'ignore' }
+              );
+            }
           }
 
           if (port === 9093) {
@@ -986,6 +1108,20 @@ export class E2EOrchestrator {
             }
           }
 
+          if (port === 6000) {
+            const redisContainer = execSync(
+              "docker ps -q -f 'name=redis' | head -1",
+              { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }
+            ).trim();
+            if (redisContainer) {
+              // Wait until the cluster is fully formed and strictly returns "cluster_state:ok"
+              execSync(
+                `docker exec ${redisContainer} sh -c 'cli=$(which valkey-cli >/dev/null 2>&1 && echo valkey-cli || echo redis-cli); $cli -p 6000 cluster info | grep cluster_state:ok'`,
+                { stdio: 'ignore' }
+              );
+            }
+          }
+
           ready = true;
           break;
         } catch {
@@ -996,8 +1132,6 @@ export class E2EOrchestrator {
       else console.warn(`   ⚠️  Port ${port} still warming up, proceeding with caution...`);
     }
 
-    // Give a final 2s for Kafka/Mongo internal sharding/init
-    await new Promise((r) => setTimeout(r, 2000));
     this._startDockerLogCapture();
   }
 
@@ -1025,18 +1159,34 @@ export class E2EOrchestrator {
 
     const migrateBin = path.resolve('./node_modules/.bin/migrate');
     const reposMigrated = new Set<string>();
+
     for (const svc of Object.values(composeServices)) {
       const repo = svc['x-repo'];
       if (!repo || reposMigrated.has(repo)) continue;
 
       const repoCfg = orchestratorCfg.repos[repo];
+      const { dbName, mongoName } = this.deduceIsolatedNames(repo, repoCfg, svc);
+
+      // ---> BOTTLENECK OPTIMIZATION: PARTIAL WARM START SHORT-CIRCUIT <---
+      // If we are doing a partial warm start, and THIS repo didn't change,
+      // AND its databases weren't explicitly targeted for a wipe (flushData),
+      // skip migrating its DB entirely to save several seconds of I/O overhead.
+      if (
+        this._partialWarmStart &&
+        !this._changedRepos.has(repo) &&
+        !repoCfg?.alwaysRedoMigration &&
+        !targetsToRedo.has(dbName) &&
+        !targetsToRedo.has(mongoName)
+      ) {
+        continue;
+      }
+
       const worktreeDir = path.join(this.worktreeBase, repo);
       const migrationsDir = path.join(worktreeDir, 'db-migrations');
 
       if (repoCfg?.skipMigration === true || !fs.existsSync(migrationsDir)) continue;
       reposMigrated.add(repo);
 
-      const { dbName, mongoName } = this.deduceIsolatedNames(repo, repoCfg, svc);
       const migrationEnv = this.buildEnvironment(worktreeDir, svc, repo, repoCfg, true);
 
       // --- REPLACE THE MINIMAL ENV HACK WITH THIS ---
@@ -1108,79 +1258,50 @@ export class E2EOrchestrator {
   async runServices() {
     const seqEnabled = !!orchestratorCfg.observability?.seq;
 
-    if (this._warmStart) {
-      // Skip respawn when: Seq is off, OR developer sets E2E_NO_RESPAWN=1.
-      // E2E_NO_RESPAWN is useful when Seq is enabled for debugging but you
-      // still want near-instant warm starts.
+    // Handle warm start with Seq enabled (respawn for log capture)
+    if (this._warmStart && this._needsRestart.size === 0) {
       const noRespawn = !seqEnabled || process.env.E2E_NO_RESPAWN === '1';
       if (noRespawn) {
-        console.log('⚡ Warm start: all services already running with current code.');
+        console.log('⚡ All services running and up-to-date.');
         return;
       }
       console.log('⚡ Warm start + Seq: respawning services for log capture (build skipped)...');
-      for (const port of this.portsToClear) {
-        try {
-          execSync(
-            `lsof -P -n -i:${port} -sTCP:LISTEN | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`,
-          );
-        } catch {}
+      for (const [name, svc] of Object.entries(composeServices)) {
+         this._needsRestart.add(name); 
+         this.killProcessesOnPorts(svc.ports); // Kill them now since setupWorktrees left them alone
       }
     }
 
-    // ── Compute affected services for PARTIAL WARM START ─────────────────────
-    // Affected = services whose repo changed + transitive dependents (they need
-    // restart too, even if their own repo didn't change, because their dependency did).
-    const affectedServices = (() => {
-      if (!this._partialWarmStart) return null; // not used in full cold/warm start
-      const direct = new Set(
-        Object.entries(composeServices)
-          .filter(([, svc]) => svc['x-repo'] && this._changedRepos.has(svc['x-repo']))
-          .map(([name]) => name),
-      );
-      // Expand transitively: if A depends on B and B is affected, A must also restart.
-      let changed = true;
-      while (changed) {
-        changed = false;
-        for (const [name, svc] of Object.entries(composeServices)) {
-          if (direct.has(name)) continue;
-          if (dependsOn(svc).some((d) => direct.has(d))) {
-            direct.add(name);
-            changed = true;
-          }
-        }
-      }
-      return direct;
-    })();
-
-    if (this._partialWarmStart && affectedServices!.size > 0) {
-      console.log(`⚡ Partial warm start: rebuilding [${[...affectedServices!].join(', ')}]...`);
-      // Kill only affected service ports
-      for (const [, svc] of Object.entries(composeServices)) {
-        const repo = svc['x-repo'];
-        if (!repo || !this._changedRepos.has(repo)) continue;
-        this.killProcessesOnPorts(svc.ports);
-      }
+    if (this._needsRestart.size === 0) {
+      console.log('⚡ All services running and up-to-date.');
+      return;
     }
 
-    // Flush Redis only on cold/partial starts — not on full warm start.
-    // On warm start, services have valid in-memory + Redis state; wiping Redis
-    // forces a 60s re-sync cycle in the game service before tests can run.
+    console.log(`🧹 Smart Restart: Rebuilding & launching [${[...this._needsRestart].join(', ')}]`);
+
     if (!this._warmStart) {
       this.flushRedis();
-      if (!this._partialWarmStart)
+      if (!this._partialWarmStart) {
         console.log('🚀 Preparing Dependencies & Builds (Concurrently)...');
+      }
     }
 
     const buildTasks: Promise<void>[] = [];
     const builtRepos = new Set<string>();
 
     if (!this._warmStart) {
+      // Ensure the global NPM cache directory exists
+      if (!fs.existsSync(this.npmCacheDir)) {
+        fs.mkdirSync(this.npmCacheDir, { recursive: true });
+      }
+
       for (const svc of Object.values(composeServices)) {
         const repo = svc['x-repo'];
         const setupCmds = svc['x-setup'] ?? [];
         if (!repo || !setupCmds.length || builtRepos.has(repo)) continue;
         // Partial warm start: only build changed repos
         if (this._partialWarmStart && !this._changedRepos.has(repo)) continue;
+
         const worktreeDir = path.join(this.worktreeBase, repo);
         builtRepos.add(repo);
 
@@ -1193,15 +1314,25 @@ export class E2EOrchestrator {
             const repoCfg = orchestratorCfg.repos[repo];
             const mergedEnv = this.buildEnvironment(worktreeDir, svc, repo, repoCfg);
 
-            // --- ADD THIS HERE ---
+            // ---> BOTTLENECK OPTIMIZATION: SHARED NPM CACHE <---
+            mergedEnv.npm_config_cache = this.npmCacheDir;
+            mergedEnv.CYPRESS_CACHE_FOLDER = path.join(this.npmCacheDir, 'Cypress');
+
             this.writePhysicalEnvFile(worktreeDir, mergedEnv);
 
             for (const cmd of setupCmds) {
               console.log(`   [BUILD] ${repo}: ${cmd}`);
-              const proc = Bun.spawn(['sh', '-c', cmd], {
+              let finalCmd = cmd;
+              if (cmd.trim() === 'npm install' || cmd.trim() === 'npm i') {
+                console.log(`   [INFO] Using optimized cached install for ${repo}...`);
+              }
+
+              // ---> FIX: Prepend 'exec ' so Node replaces the shell
+              const proc = Bun.spawn(['sh', '-c', `exec ${finalCmd}`], {
                 cwd: worktreeDir,
                 env: mergedEnv as any,
               });
+
               await proc.exited;
               if (proc.exitCode !== 0) {
                 const err = await new Response(proc.stderr).text();
@@ -1232,12 +1363,10 @@ export class E2EOrchestrator {
       readyMap.set(name, { resolve, promise });
     }
 
-    // Partial warm start: pre-resolve readyMap for unchanged services (still running).
-    if (this._partialWarmStart && affectedServices) {
-      for (const [name] of nativeServices) {
-        if (!affectedServices.has(name)) {
-          readyMap.get(name)!.resolve();
-        }
+    // Pre-resolve readyMap for unchanged services (still running).
+    for (const [name] of nativeServices) {
+      if (!needsRestart.has(name)) {
+        readyMap.get(name)!.resolve();
       }
     }
 
@@ -1245,8 +1374,8 @@ export class E2EOrchestrator {
 
     const launchTasks = nativeServices.map(([name, svc]) =>
       (async () => {
-        // Partial warm start: skip services that don't need restart
-        if (this._partialWarmStart && affectedServices && !affectedServices.has(name)) {
+        // ---> SURGICAL LAUNCH <---
+        if (!needsRestart.has(name)) {
           console.log(`   ⚡ ${name}: unchanged, staying warm`);
           return;
         }
@@ -1272,18 +1401,18 @@ export class E2EOrchestrator {
         const serviceStream = this.openServiceStream(name, port);
         const dec = new TextDecoder();
 
-        // --- ADD THIS HERE ---
         this.writePhysicalEnvFile(worktreeDir, mergedEnv);
 
         console.log(`   [START] ${name}: ${svc.command!}`);
-        const proc = Bun.spawn(['sh', '-c', svc.command!], {
+        
+        // ---> FIX: Prepend 'exec ' so Node replaces the shell
+        const proc = Bun.spawn(['sh', '-c', `exec ${svc.command!}`], {
           cwd: worktreeDir,
           env: mergedEnv as any,
           stdout: 'pipe',
           stderr: 'pipe',
         });
 
-        // 1. Create an abort controller for this process's streams
         const ac = new AbortController();
         this.streamControllers.push(ac);
 
@@ -1336,7 +1465,7 @@ export class E2EOrchestrator {
     await Promise.all(launchTasks);
     await Promise.all(healthCheckResults);
 
-    console.log('\n✅ All services started.\n');
+    console.log('\n✅ All targeted services started.\n');
   }
 
   private async pollHealthCheck(name: string, url: string): Promise<void> {
@@ -1369,44 +1498,106 @@ export class E2EOrchestrator {
    *   await orchestrator.ensureReady(api, BILLING_URL, GAME_URL, SERVICE_SIGNATURE, TARGET_GAME_CODE);
    */
   async ensureReady(
-    api: {
-      get: (url: string, opts?: any) => Promise<{ status: number; data: any }>;
-      propagateConfig: () => Promise<void>;
-      resetGameState: (code: string) => Promise<void>;
-    },
-    billingUrl: string,
-    gameUrl: string,
-    serviceSignature: Record<string, string>,
-    targetGameCode: string,
+    api: any, billingUrl: string, gameUrl: string, serviceSignature: any, targetGameCode: string,
   ): Promise<void> {
-    if (await this._tryWarmPath()) {
-      // ── Warm path: services healthy + code matches → skip everything ──────
+    const state = this._loadReadyState();
+    
+    if (state) {
+      console.log('\n⚡ [Super Optimistic] Bypassing blocks. Executing tests instantly.\n');
+      this._warmStart = true;
       this._startDockerLogCapture();
-      this._startBackgroundValidation();
-    } else if (await this._tryRestartPath()) {
-      // ── Restart path: code matches but services dead → restart only ────────
-      // Skip setupWorktrees (worktrees already correct) and runGlobalMigrations
-      // (nothing changed in DB schema). Just bring infra up if needed and
-      // restart Node services. Avoids ~60s of migration overhead on service crash.
-      await this.startInfrastructure();
-      await this.runServices();
-      await this._waitForCaches(api, billingUrl, gameUrl, serviceSignature, targetGameCode);
-      this._writeReadyState();
-      this._startDockerLogCapture();
-      this._startBackgroundValidation();
-    } else {
-      // ── Cold path: full setup ─────────────────────────────────────────────
-      await this.setupWorktrees();
-      await this.startInfrastructure();
-      await this.runGlobalMigrations();
-      await this.runServices();
-      await this._waitForCaches(api, billingUrl, gameUrl, serviceSignature, targetGameCode);
-      this._writeReadyState();
+      
+      // Fire validations entirely in the background while tests are running
+      this._bgValidation = this._runSuperOptimisticValidation(state);
+      return;
     }
 
-    // Always print exactly once — after warm or cold path completes.
-    // Swagger probing runs concurrently (800ms timeout per service, all parallel).
+    // Fallback: Cold Start
+    await this.setupWorktrees();
+    await this.startInfrastructure();
+    await this.runGlobalMigrations();
+    await this.runServices();
+    await this._waitForCaches(api, billingUrl, gameUrl, serviceSignature, targetGameCode);
+    this._writeReadyState();
     await this.printEnvironmentSummary();
+  }
+
+  private async _runSuperOptimisticValidation(state: E2EReadyState): Promise<void> {
+    const stream = this.ensureMasterStream();
+    const logBg = (msg: string) => {
+      console.log(msg);
+      stream?.write(`${msg}\n`);
+    };
+
+    try {
+      // 1. Verify Local Targets (If you changed YAML targets, this fails instantly)
+      const shaMatch = await this._checkWorktreeSHAs(state.worktrees);
+      if (!shaMatch) {
+        logBg('⚠️  [bg-validation] Local target changed or git HEAD moved.');
+        throw new Error('Local environment changed');
+      }
+
+      // 2. Verify Health (If a service crashed between test runs, this fails)
+      const healthy = await this._checkServicesHealthy();
+      if (!healthy) {
+        logBg('⚠️  [bg-validation] One or more services are dead or unresponsive.');
+        throw new Error('Services unhealthy');
+      }
+
+      // 3. Verify Remote Branches (If a teammate pushed code, this fails)
+      const branches = Object.entries(orchestratorCfg.repos)
+        .filter(([, repo]) => !/^v?\d+\.\d+/.test(repo.target))
+        .map(([repoKey, repo]) => {
+          const isExplicitRemote = repo.target.startsWith('origin/');
+          return {
+            repoKey, repoPath: path.resolve(repo.repoPath), target: repo.target,
+            branchName: isExplicitRemote ? repo.target.substring(7) : repo.target,
+            isExplicitRemote, targetDir: path.join(this.worktreeBase, repoKey),
+          };
+        });
+
+      const seen = new Map<string, Promise<string | null>>();
+      for (const { repoPath, branchName } of branches) {
+        const key = `${repoPath}::${branchName}`;
+        if (!seen.has(key)) {
+          seen.set(key, this.runAsyncOutput(`git ls-remote origin refs/heads/${branchName}`, repoPath)
+              .then((out) => out.split('\n')[0]?.split('\t')[0]?.trim() || null)
+              .catch(() => null));
+        }
+      }
+
+      for (const { repoKey, targetDir, target, branchName, isExplicitRemote, repoPath } of branches) {
+        const remoteSha = await seen.get(`${repoPath}::${branchName}`)!;
+        if (!remoteSha) continue;
+        const headSha = await this.runAsyncOutput('git log -1 --format=%H HEAD', targetDir).catch(() => '');
+
+        if (headSha !== remoteSha) {
+          if (isExplicitRemote) {
+            logBg(`⚠️  [bg-validation] ${repoKey} @ ${target}: remote moved.`);
+            throw new Error('Remote branch moved');
+          } else {
+            const mergeBase = await this.runAsyncOutput(`git merge-base HEAD ${remoteSha}`, targetDir).catch(() => null);
+            if (mergeBase === headSha) {
+              logBg(`⚠️  [bg-validation] ${repoKey} @ ${target}: remote has new commits.`);
+              throw new Error('Remote branch moved');
+            }
+          }
+        } else {
+           logBg(`✓  [bg-validation] ${repoKey} @ ${target}: up-to-date (${headSha.slice(0, 8)})`);
+        }
+      }
+    } catch (e) {
+      // ---> THE FIX <---
+      // Delete the ready state so the next run knows to execute a Cold Start
+      this._deleteReadyState();
+      
+      // Because this promise floats in the background, throwing here causes an 
+      // Unhandled Promise Rejection which kills the test suite BEFORE `afterAll` runs.
+      // We MUST write the marker file right here so the Bash wrapper knows to restart.
+      fs.writeFileSync(path.resolve('logs/.rerun-needed'), '');
+      
+      throw e; 
+    }
   }
 
   /** Reads ready-state and verifies health + SHA match. Fast (<300ms). */
@@ -1476,36 +1667,39 @@ export class E2EOrchestrator {
   private _startBackgroundValidation(): void {
     const branches = Object.entries(orchestratorCfg.repos)
       .filter(([, repo]) => !/^v?\d+\.\d+/.test(repo.target))
-      .map(([repoKey, repo]) => ({
-        repoKey,
-        repoPath: path.resolve(repo.repoPath),
-        target: repo.target,
-        targetDir: path.join(this.worktreeBase, repoKey),
-      }));
+      .map(([repoKey, repo]) => {
+        const isExplicitRemote = repo.target.startsWith('origin/');
+        return {
+          repoKey,
+          repoPath: path.resolve(repo.repoPath),
+          target: repo.target,
+          branchName: isExplicitRemote ? repo.target.substring(7) : repo.target,
+          isExplicitRemote,
+          targetDir: path.join(this.worktreeBase, repoKey),
+        };
+      });
 
     if (branches.length === 0) {
       this._bgValidation = Promise.resolve();
       return;
     }
 
-    // Ensure logs go to the master log file even on warm path (stream may not exist yet).
     const stream = this.ensureMasterStream();
     const logBg = (msg: string) => {
       console.log(msg);
       stream?.write(`${msg}\n`);
     };
 
-    // Deduplicate ls-remote calls by (repoPath, branch)
     const seen = new Map<string, Promise<string | null>>();
-    for (const { repoPath, target } of branches) {
-      const key = `${repoPath}::${target}`;
+    for (const { repoPath, branchName } of branches) {
+      const key = `${repoPath}::${branchName}`;
       if (!seen.has(key)) {
         seen.set(
           key,
-          this.runAsyncOutput(`git ls-remote origin refs/heads/${target}`, repoPath)
+          this.runAsyncOutput(`git ls-remote origin refs/heads/${branchName}`, repoPath)
             .then((out) => out.split('\n')[0]?.split('\t')[0]?.trim() || null)
             .catch(() => {
-              logBg(`[bg-validation] ⚠️  ls-remote failed for ${target}`);
+              logBg(`[bg-validation] ⚠️  ls-remote failed for ${branchName}`);
               return null;
             }),
         );
@@ -1513,21 +1707,42 @@ export class E2EOrchestrator {
     }
 
     this._bgValidation = Promise.all(
-      branches.map(async ({ repoKey, targetDir, target, repoPath }) => {
-        const remoteSha = await seen.get(`${repoPath}::${target}`)!;
-        if (!remoteSha) return;
-        const headSha = await this.runAsyncOutput('git log -1 --format=%H HEAD', targetDir).catch(
-          () => '',
-        );
-        if (headSha !== remoteSha) {
-          logBg(
-            `⚠️  [bg-validation] ${repoKey} @ ${target}: remote moved (local ${headSha.slice(0, 8)} → remote ${remoteSha.slice(0, 8)})`,
+      branches.map(
+        async ({ repoKey, targetDir, target, branchName, isExplicitRemote, repoPath }) => {
+          const remoteSha = await seen.get(`${repoPath}::${branchName}`)!;
+          if (!remoteSha) return;
+          const headSha = await this.runAsyncOutput('git log -1 --format=%H HEAD', targetDir).catch(
+            () => '',
           );
-          this._deleteReadyState();
-        } else {
-          logBg(`✓  [bg-validation] ${repoKey} @ ${target}: up-to-date (${headSha.slice(0, 8)})`);
-        }
-      }),
+
+          if (headSha !== remoteSha) {
+            if (isExplicitRemote) {
+              logBg(
+                `⚠️  [bg-validation] ${repoKey} @ ${target}: remote moved (local ${headSha.slice(0, 8)} → remote ${remoteSha.slice(0, 8)})`,
+              );
+              this._deleteReadyState();
+            } else {
+              // Local branch: check if remote is strictly ahead
+              const mergeBase = await this.runAsyncOutput(
+                `git merge-base HEAD ${remoteSha}`,
+                targetDir,
+              ).catch(() => null);
+              if (mergeBase === headSha) {
+                logBg(
+                  `⚠️  [bg-validation] ${repoKey} @ ${target}: remote has new commits. Environment will reset on next run.`,
+                );
+                this._deleteReadyState();
+              } else {
+                logBg(
+                  `✓  [bg-validation] ${repoKey} @ ${target}: local has unpushed commits (safe).`,
+                );
+              }
+            }
+          } else {
+            logBg(`✓  [bg-validation] ${repoKey} @ ${target}: up-to-date (${headSha.slice(0, 8)})`);
+          }
+        },
+      ),
     ).then(() => {}) as Promise<void>;
   }
 
@@ -1648,6 +1863,13 @@ export class E2EOrchestrator {
 
     // Sever all active log streams so the Bun event loop can close
     this.streamControllers.forEach((ac) => ac.abort());
+
+    // --> ADD THIS: Close physical file descriptors <--
+    this.activeStreams.forEach((stream) => {
+      try {
+        stream.end();
+      } catch {}
+    });
 
     const forceTeardown = process.env.E2E_TEARDOWN === '1';
     if (!orchestratorCfg.global.cleanOnTeardown && !forceTeardown) {
@@ -1871,7 +2093,9 @@ export class E2EOrchestrator {
               console.log(output.toString().replace(/\n$/, ''));
             } catch (e: any) {
               console.warn(`   ⚠️  Failed to clear Redis prefix ${prefix}:*`);
-              if (e.stderr) console.warn(`      Error: ${e.stderr.toString().trim()}`);
+              // ---> FIX: Fallback to e.message if stderr is empty <---
+              const errMsg = e.stderr ? e.stderr.toString().trim() : '';
+              console.warn(`      Error: ${errMsg || e.message || 'Unknown error'}`);
             }
           }
         }

@@ -30,7 +30,7 @@ original_bashscripts/.token-cache.json
 .automation_test/
 
 # Editor / IDE
-.vscode/
+# .vscode/
 .idea/
 *.suo
 *.ntvs*

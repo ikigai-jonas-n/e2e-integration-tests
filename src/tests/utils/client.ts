@@ -4,7 +4,13 @@
  * focused on the WHAT (assertions) not the HOW (header wiring).
  */
 import { api } from './api';
-import { BILLING_URL, GAME_URL, SERVICE_SIGNATURE, TARGET_GAME_CODE, TARGET_RTP_CODE } from './config';
+import {
+  BILLING_URL,
+  GAME_URL,
+  SERVICE_SIGNATURE,
+  TARGET_GAME_CODE,
+  TARGET_RTP_CODE,
+} from './config';
 
 // ─── Shared player constants ──────────────────────────────────────────────────
 
@@ -91,12 +97,12 @@ export const gameClient = {
   ) {
     // 2. Assign the default values during object destructuring
     const {
-      gameCode = TARGET_GAME_CODE,     // <-- DEFAULT ASSIGNED HERE
+      gameCode = TARGET_GAME_CODE, // <-- DEFAULT ASSIGNED HERE
       playerId = KYLE.playerId,
       externalPlayerId = KYLE.externalPlayerId,
       operator = KYLE.operator,
       brand = KYLE.brand,
-      rtpCode = TARGET_RTP_CODE,       // <-- DEFAULT ASSIGNED HERE
+      rtpCode = TARGET_RTP_CODE, // <-- DEFAULT ASSIGNED HERE
       country = 'GB',
       currency = 'EUR',
     } = opts;
@@ -104,13 +110,13 @@ export const gameClient = {
     return api.post(
       `${GAME_URL}/v2/service/session/start`,
       {
-        gameCode,                      // <-- Uses the destructured variable
+        gameCode, // <-- Uses the destructured variable
         lang: 'en',
         country,
-        gameSetting: { 
-          rtpConfigCode: rtpCode,      // <-- Uses the destructured variable
-          isGeoBlocking: true, 
-          jurisdictionCode: 'slotJD' 
+        gameSetting: {
+          rtpConfigCode: rtpCode, // <-- Uses the destructured variable
+          isGeoBlocking: true,
+          jurisdictionCode: 'slotJD',
         },
         mode: 'real',
         operator,
