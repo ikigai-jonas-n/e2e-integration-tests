@@ -4,7 +4,7 @@ import { parse as parseYaml } from 'yaml';
 
 import { afterAll, beforeAll, describe } from 'bun:test';
 import { E2EOrchestrator } from '../E2EOrchestrator';
-import { api, log } from './utils/api';
+import { api } from './utils/api';
 import { BILLING_URL, GAME_URL, SERVICE_SIGNATURE, TARGET_GAME_CODE } from './utils/config';
 
 // Unit-test style specs (individual endpoint coverage)
@@ -21,53 +21,13 @@ import { runMaintenanceFlowTests } from './specs/maintenance-flow.spec';
 const orchestrator = new E2EOrchestrator();
 
 beforeAll(async () => {
-  await orchestrator.setupWorktrees();
-  await orchestrator.startInfrastructure();
-  await orchestrator.runGlobalMigrations();
-  await orchestrator.runServices();
-
-  log('[setup] Waiting for caches to warm up (Billing + Game)...');
-  let cacheReady = false;
-  // Increase timeout to 120s for slow cold starts
-  for (let i = 0; i < 120; i++) {
-    try {
-      const [bRes, gRes] = await Promise.all([
-        api.get(`${BILLING_URL}/v2/service/games`, { headers: SERVICE_SIGNATURE }),
-        api.get(`${GAME_URL}/v2/service/games`, { headers: SERVICE_SIGNATURE }),
-        api.propagateConfig(), // Ensure config is propagated from billing to game
-      ]);
-
-      const bGames = bRes.data?.data?.games ?? bRes.data?.data ?? [];
-      const gGames = gRes.data?.data?.games ?? gRes.data?.data ?? [];
-
-      if (bGames.length > 0 && gGames.length > 0) {
-        log(`[setup] Caches ready: Billing(${bGames.length}), Game(${gGames.length})`);
-        cacheReady = true;
-        break;
-      }
-
-      if (i % 10 === 0) {
-        log(`[setup] Progress: Billing=${bGames.length} games, Game=${gGames.length} games...`);
-      }
-    } catch (e) {
-      if (i % 20 === 0) log(`[setup] Connection pending...`);
-    }
-    await new Promise((r) => setTimeout(r, 1000));
-  }
-
-  if (!cacheReady)
-    throw new Error(
-      'Timeout: Services online but process caches are empty. Check DB connectivity.',
-    );
-
-  // --- ADD THIS HERE ---
-log(`[setup] Ensuring ${TARGET_GAME_CODE} is in a clean, enabled state...`);
-await api.resetGameState(TARGET_GAME_CODE);
-
-  log('✅ Setup complete.');
+  await orchestrator.ensureReady(api, BILLING_URL, GAME_URL, SERVICE_SIGNATURE, TARGET_GAME_CODE);
 }, 600000);
 
 afterAll(async () => {
+  // Await background branch validation before tearing down.
+  // If any branch moved on remote: deletes ready-state, exits 75 → wrapper reruns.
+  await orchestrator.awaitBackgroundValidation();
   await orchestrator.teardown();
 }, 60000);
 

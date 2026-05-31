@@ -1,4 +1,14 @@
-#!/bin/bash
+#!/usr/bin/env bash
+# run-tests.sh — single runner for all bun test variants.
+#
+# Sets up a timestamped log directory, captures all output, splits per-suite
+# logs, generates a failure summary, and handles automatic rerun when the
+# background branch-validation detects the environment went stale mid-run.
+#
+# Usage (via package.json scripts):
+#   bash src/scripts/run-tests.sh                  # full suite, no timeout
+#   bash src/scripts/run-tests.sh --timeout 5000   # fast mode
+
 set -o pipefail
 
 TIMESTAMP=$(date +"%Y-%m-%d_%H-%M-%S")
@@ -7,22 +17,35 @@ mkdir -p "$LOG_DIR"
 
 MASTER_LOG="$LOG_DIR/_master.log"
 FAIL_LOG="$LOG_DIR/_failures.log"
+MARKER="logs/.rerun-needed"
+
+rm -f "$MARKER"
 
 echo "==============================================="
 echo " Starting E2E Integration Suite..."
 echo " Log dir: $LOG_DIR"
 echo "==============================================="
 
-# Run full suite.
 # E2E_LOG_DIR → orchestrator writes per-service logs + master log there.
-# tee captures bun:test stdout/stderr into _master.log too.
-# Change this line:
-E2E_LOG_DIR="$LOG_DIR" bun test src/tests 2>&1 | tee "$MASTER_LOG"
+# FORCE_COLOR=1 → bun emits ANSI codes even when stdout is piped.
+# tee writes colored output to the terminal; the process substitution strips
+# ANSI escape codes before writing to the log file (clean, searchable logs).
+E2E_LOG_DIR="$LOG_DIR" FORCE_COLOR=1 bun test src/tests "$@" 2>&1 \
+  | tee >(sed 's/\x1b\[[0-9;]*[mGKHFJA-Za-z]//g' > "$MASTER_LOG")
 TEST_EXIT_CODE=${PIPESTATUS[0]}
 
+# ── Auto-rerun on stale environment ──────────────────────────────────────────
+# Background branch-validation writes this marker when remote branches moved.
+# Re-execute with a fresh timestamp and log dir so setup runs clean.
+if [ -f "$MARKER" ]; then
+  rm -f "$MARKER"
+  echo ""
+  echo "🔄 Remote branches updated during run. Rerunning with fresh environment..."
+  echo ""
+  exec "$0" "$@"
+fi
+
 # ── Split master log into per-suite test logs ─────────────────────────────────
-# e2e.spec.ts emits __E2E_SUITE_START__:<slug> / __E2E_SUITE_END__:<slug> markers.
-# Lines between markers go into LOG_DIR/test_<slug>.log.
 if [ -f "$MASTER_LOG" ]; then
   awk -v logdir="$LOG_DIR" '
     /__E2E_SUITE_START__:/ {
@@ -61,9 +84,7 @@ if [ $TEST_EXIT_CODE -ne 0 ] && [ -f "$MASTER_LOG" ]; then
     echo "Service logs to inspect:"
     for f in "$LOG_DIR"/*.log; do
       fname=$(basename "$f")
-      if [[ "$fname" != _* ]]; then
-        echo "  → $f"
-      fi
+      [[ "$fname" != _* ]] && echo "  → $f"
     done
     echo ""
 
@@ -93,7 +114,7 @@ if [ $TEST_EXIT_CODE -ne 0 ] && [ -f "$MASTER_LOG" ]; then
   echo "Full details → $FAIL_LOG"
 fi
 
-# Convenience symlink: logs/latest → current run folder
+# Convenience symlink
 (cd logs && rm -f latest && ln -s "$TIMESTAMP" latest)
 
 exit $TEST_EXIT_CODE

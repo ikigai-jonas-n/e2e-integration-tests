@@ -4,9 +4,9 @@
   "description": "",
   "main": "index.js",
   "scripts": {
-    "test": "./src/run-e2e.sh",
-    "test:raw": "bun test src/tests",
-    "test:fast": "bun test src/tests --timeout 5000",
+    "test": "bash src/scripts/run-tests.sh",
+    "test:raw": "bash src/scripts/run-tests.sh",
+    "test:fast": "bash src/scripts/run-tests.sh --timeout 5000",
     "setup:env": "bun run src/scripts/dev-services.ts",
     "reset": "bash src/scripts/reset.sh",
     "lint": "bun run type:check && bun run prettier:check && bun run lint:code",
