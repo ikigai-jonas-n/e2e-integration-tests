@@ -33,14 +33,14 @@ services:
     ports:
       - "9000:9000"
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:9000/v1/service/healthcheck"]
-      interval: 2s
-      timeout: 3s
+      test: ["CMD-SHELL", "curl -f -s -m 2 http://127.0.0.1:9000/v1/service/healthcheck || exit 1"]
+      interval: 1s
+      timeout: 2s
       retries: 30
+      start_period: 1s
 
   # ── remote-game-server ──────────────────────────────────────────────────────
   billing:
-    # x-repo: remote-game-server
     x-repo: remote-game-server-billing
     x-env-file: .env.billing.example
     x-setup:
@@ -69,14 +69,19 @@ services:
       S3_ENDPOINT: "http://127.0.0.1:7002"
     ports:
       - "8080:8080"
+    depends_on:
+      kafka-region:
+        condition: service_healthy
+      kafka-global:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8080/v2/service/healthcheck"]
-      interval: 2s
-      timeout: 3s
+      test: ["CMD-SHELL", "curl -f -s -m 2 http://127.0.0.1:8080/v2/service/healthcheck || exit 1"]
+      interval: 1s
+      timeout: 2s
       retries: 30
+      start_period: 1s
 
   game:
-      # x-repo: remote-game-server
       x-repo: remote-game-server-game
       x-env-file: .env.game.example
       x-setup:
@@ -111,14 +116,18 @@ services:
           condition: service_healthy
         game-activity:
           condition: service_healthy
+        kafka-region:
+          condition: service_healthy
+        kafka-global:
+          condition: service_healthy
       healthcheck:
-        test: ["CMD", "curl", "-sf", "http://127.0.0.1:19080/v2/service/healthcheck"]
-        interval: 2s
-        timeout: 3s
+        test: ["CMD-SHELL", "curl -f -s -m 2 http://127.0.0.1:19080/v2/service/healthcheck || exit 1"]
+        interval: 1s
+        timeout: 2s
         retries: 30
+        start_period: 1s
 
   bridge:
-      # x-repo: remote-game-server
       x-repo: remote-game-server-bridge
       x-env-file: .env.bridge.example
       x-setup:
@@ -140,15 +149,19 @@ services:
       depends_on:
         billing:
           condition: service_healthy
-      # ---> ADD THIS BLOCK <---
+        kafka-region:
+          condition: service_healthy
+        kafka-global:
+          condition: service_healthy
       healthcheck:
-        test: ["CMD", "curl", "-sf", "http://127.0.0.1:7001/v2/service/healthcheck"]
-        interval: 2s
-        timeout: 3s
+        test: ["CMD-SHELL", "curl -f -s -m 2 http://127.0.0.1:7001/v2/service/healthcheck || exit 1"]
+        interval: 1s
+        timeout: 2s
         retries: 30
+        start_period: 1s
 
   game-activity:
-    x-repo: remote-game-server-no-db     # main branch — triggers build for jobs too
+    x-repo: remote-game-server-no-db
     x-env-file: .env.game-activity.example
     x-setup:
       - npm install
@@ -163,11 +176,15 @@ services:
       NODE_PATH: ./build
     ports:
       - "8070:8070"
+    depends_on:
+      kafka-region:
+        condition: service_healthy
     healthcheck:
-      test: ["CMD", "curl", "-sf", "http://127.0.0.1:8070/v2/service/healthcheck"]
-      interval: 2s
-      timeout: 3s
+      test: ["CMD-SHELL", "curl -f -s -m 2 http://127.0.0.1:8070/v2/service/healthcheck || exit 1"]
+      interval: 1s
+      timeout: 2s
       retries: 30
+      start_period: 1s
 
   job-stale-rounds:
     x-repo: remote-game-server-no-db
@@ -216,5 +233,3 @@ services:
         condition: service_healthy
 
 # NOTE: Observability tools (Seq, Dozzle) live in docker-compose.observability.yml.
-# They are started separately because this file contains native Bun-spawned services
-# that have no Docker image — Docker would reject the file if both were mixed here.

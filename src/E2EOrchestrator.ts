@@ -94,7 +94,14 @@ function hostPort(ports: string[] | undefined): number | null {
 function healthCheckUrl(svc: ComposeService): string | null {
   const args = svc.healthcheck?.test;
   if (!args) return null;
-  return args.find((a) => a.startsWith('http://') || a.startsWith('https://')) ?? null;
+
+  for (const a of args) {
+    // Extract the URL even if it is buried inside a CMD-SHELL bash string
+    const match = a.match(/(https?:\/\/[^\s"']+)/);
+    if (match) return match[1];
+  }
+
+  return null;
 }
 
 function dependsOn(svc: ComposeService): string[] {
@@ -414,7 +421,9 @@ export class E2EOrchestrator {
     if (this._deadServices.size === 0) {
       console.log(`   Services:  ✅ all health checks passed`);
     } else {
-      console.log(`   Services:  ❌ dead services detected: [${[...this._deadServices].join(', ')}]`);
+      console.log(
+        `   Services:  ❌ dead services detected: [${[...this._deadServices].join(', ')}]`,
+      );
     }
 
     // Cache checks...
@@ -427,7 +436,9 @@ export class E2EOrchestrator {
     }
     const cacheResults = await Promise.all(
       [...uniqueRepos.entries()].map(async ([repo, svcDir]) => ({
-        repo, svcDir, status: await new Promise<string>((res) => res(this.buildCacheStatus(svcDir))),
+        repo,
+        svcDir,
+        status: await new Promise<string>((res) => res(this.buildCacheStatus(svcDir))),
       })),
     );
     let allCached = true;
@@ -441,7 +452,7 @@ export class E2EOrchestrator {
     }
 
     this._warmStart = this._deadServices.size === 0 && allCached;
-    this._partialWarmStart = !this._warmStart; 
+    this._partialWarmStart = !this._warmStart;
 
     // ---> NEW: Compute exactly what needs restarting here <---
     this._needsRestart = new Set([...this._deadServices]);
@@ -491,8 +502,13 @@ export class E2EOrchestrator {
     return new Promise((resolve, reject) => {
       // ---> FIX: Inject aggressive SSH timeout to prevent 2.5 minute hangs <---
       const mergedEnv = { ...env, GIT_SSH_COMMAND: 'ssh -o ConnectTimeout=5 -o BatchMode=yes' };
-      const proc = Bun.spawn(cmd.split(' '), { cwd, env: mergedEnv, stdout: 'pipe', stderr: 'pipe' });
-      
+      const proc = Bun.spawn(cmd.split(' '), {
+        cwd,
+        env: mergedEnv,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
+
       proc.exited.then(async () => {
         if (proc.exitCode === 0) resolve();
         else {
@@ -506,8 +522,16 @@ export class E2EOrchestrator {
   private runAsyncOutput(cmd: string, cwd: string, timeoutMs = 10000): Promise<string> {
     return new Promise((resolve, reject) => {
       // ---> FIX: SSH Timeout + JavaScript fallback timeout for ls-remote <---
-      const mergedEnv = { ...process.env, GIT_SSH_COMMAND: 'ssh -o ConnectTimeout=5 -o BatchMode=yes' };
-      const proc = Bun.spawn(cmd.split(' '), { cwd, env: mergedEnv, stdout: 'pipe', stderr: 'pipe' });
+      const mergedEnv = {
+        ...process.env,
+        GIT_SSH_COMMAND: 'ssh -o ConnectTimeout=5 -o BatchMode=yes',
+      };
+      const proc = Bun.spawn(cmd.split(' '), {
+        cwd,
+        env: mergedEnv,
+        stdout: 'pipe',
+        stderr: 'pipe',
+      });
 
       // Fallback: If git hangs on an HTTP fetch instead of SSH, kill it after 10s
       const timer = setTimeout(() => {
@@ -859,48 +883,63 @@ export class E2EOrchestrator {
 
         if (stale.length > 0) {
           await Promise.all(
-            stale.map(async ({ repoName, targetDir, target, branchName, isExplicitRemote, hasRemote }) => {
-              console.log(`   -> ${repoName} @ ${target}: syncing with remote...`);
-              await this.runAsync('git fetch --all --tags', targetDir);
-              try {
-                if (isExplicitRemote) {
-                  await this.runAsync(`git checkout --detach origin/${branchName}`, targetDir);
-                } else {
-                  // Try to checkout the local branch
-                  await this.runAsync(`git checkout ${branchName}`, targetDir).catch(async () => {
-                    // If it failed, try detaching (handles locked branch in another worktree)
-                    await this.runAsync(`git checkout --detach ${branchName}`, targetDir).catch(async (err2: any) => {
-                      if (hasRemote) {
-                        await this.runAsync(`git checkout -b ${branchName} origin/${branchName}`, targetDir);
-                      } else {
-                        throw err2;
-                      }
+            stale.map(
+              async ({ repoName, targetDir, target, branchName, isExplicitRemote, hasRemote }) => {
+                console.log(`   -> ${repoName} @ ${target}: syncing with remote...`);
+                await this.runAsync('git fetch --all --tags', targetDir);
+                try {
+                  if (isExplicitRemote) {
+                    await this.runAsync(`git checkout --detach origin/${branchName}`, targetDir);
+                  } else {
+                    // Try to checkout the local branch
+                    await this.runAsync(`git checkout ${branchName}`, targetDir).catch(async () => {
+                      // If it failed, try detaching (handles locked branch in another worktree)
+                      await this.runAsync(`git checkout --detach ${branchName}`, targetDir).catch(
+                        async (err2: any) => {
+                          if (hasRemote) {
+                            await this.runAsync(
+                              `git checkout -b ${branchName} origin/${branchName}`,
+                              targetDir,
+                            );
+                          } else {
+                            throw err2;
+                          }
+                        },
+                      );
                     });
-                  });
-                  
-                  if (hasRemote) {
-                    // Attempt safe fast-forward
-                    await this.runAsync(`git pull --ff-only origin ${branchName}`, targetDir).catch(
-                      () => {
+
+                    if (hasRemote) {
+                      // Attempt safe fast-forward
+                      await this.runAsync(
+                        `git pull --ff-only origin ${branchName}`,
+                        targetDir,
+                      ).catch(() => {
                         console.log(
                           `   -> ⚠️  ${repoName}: Local branch '${branchName}' has unpushed commits or diverged. Keeping local state.`,
                         );
-                      },
-                    );
-                  } else {
-                    console.log(`   -> ℹ️  ${repoName}: Local branch '${branchName}' is unpushed. Using local state.`);
+                      });
+                    } else {
+                      console.log(
+                        `   -> ℹ️  ${repoName}: Local branch '${branchName}' is unpushed. Using local state.`,
+                      );
+                    }
                   }
+                } catch (e: any) {
+                  // Extract the real Git error message so it's not hidden
+                  const gitMsg =
+                    e.message.split('\n').slice(1).join(' ').trim() || e.message.split('\n')[0];
+                  console.log(
+                    `   -> ❌ ${repoName}: Failed to checkout ${target} (Git: ${gitMsg})`,
+                  );
+                  if (!hasRemote) {
+                    console.log(
+                      `   -> ℹ️  Tip: Make sure the branch is spelled correctly and exists in the main repo.`,
+                    );
+                  }
+                  throw e; // Halt the orchestrator so it doesn't run tests on the wrong code
                 }
-              } catch (e: any) {
-                // Extract the real Git error message so it's not hidden
-                const gitMsg = e.message.split('\n').slice(1).join(' ').trim() || e.message.split('\n')[0];
-                console.log(`   -> ❌ ${repoName}: Failed to checkout ${target} (Git: ${gitMsg})`);
-                if (!hasRemote) {
-                  console.log(`   -> ℹ️  Tip: Make sure the branch is spelled correctly and exists in the main repo.`);
-                }
-                throw e; // Halt the orchestrator so it doesn't run tests on the wrong code
-              }
-            }),
+              },
+            ),
           );
         }
       }
@@ -911,15 +950,17 @@ export class E2EOrchestrator {
     // ---> FIX: Only kill the ports of services we actually plan to restart <---
     if (this._needsRestart.size > 0) {
       const portsToKill = [...this._needsRestart]
-        .flatMap(name => composeServices[name]?.ports || [])
-        .map(p => hostPort([p]))
-        .filter(p => p !== null);
-        
+        .flatMap((name) => composeServices[name]?.ports || [])
+        .map((p) => hostPort([p]))
+        .filter((p) => p !== null);
+
       if (portsToKill.length > 0) {
         console.log(`🧹 Smart cleanup: clearing ports [${portsToKill.join(', ')}]`);
         for (const port of portsToKill) {
           try {
-            execSync(`lsof -P -n -i:${port} -sTCP:LISTEN | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`);
+            execSync(
+              `lsof -P -n -i:${port} -sTCP:LISTEN | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`,
+            );
           } catch {}
         }
       }
@@ -1094,7 +1135,7 @@ export class E2EOrchestrator {
 
     // ---> DYNAMIC PORT DETECTION <---
     console.log('⏳ Dynamically parsing Infrastructure Ports to accept connections...');
-    
+
     interface InfraPort {
       port: number;
       serviceName: string;
@@ -1105,7 +1146,7 @@ export class E2EOrchestrator {
       isKafka: boolean;
       isRedis: boolean;
     }
-    
+
     const infraPorts: InfraPort[] = [];
 
     // Parse the Compose files we just deployed
@@ -1113,10 +1154,10 @@ export class E2EOrchestrator {
       const dir = path.join(this.worktreeBase, repoName);
       const composeFile = path.join(dir, 'docker-compose.yml');
       if (!fs.existsSync(composeFile)) continue;
-      
+
       const content = fs.readFileSync(composeFile, 'utf-8');
       const doc = parseYaml(content) as any;
-      
+
       if (doc?.services) {
         for (const [svcName, svc] of Object.entries<any>(doc.services)) {
           if (svc.ports) {
@@ -1125,10 +1166,11 @@ export class E2EOrchestrator {
               if (hostP && !isNaN(hostP)) {
                 const img = String(svc.image || '').toLowerCase();
                 const sName = svcName.toLowerCase();
-                
+
                 // ---> FIX: If it is Redis/Valkey, completely ignore it <---
-                const isRedis = img.includes('redis') || img.includes('valkey') || sName.includes('redis');
-                if (isRedis) continue; 
+                const isRedis =
+                  img.includes('redis') || img.includes('valkey') || sName.includes('redis');
+                if (isRedis) continue;
 
                 infraPorts.push({
                   port: hostP,
@@ -1136,9 +1178,13 @@ export class E2EOrchestrator {
                   repoName,
                   dir,
                   isMongo: img.includes('mongo') || sName.includes('mongo'),
-                  isPostgres: img.includes('postgres') || img.includes('timescale') || sName.includes('db'),
-                  isKafka: img.includes('kafka') || img.includes('bitnami/kafka') || sName.includes('queue'),
-                  isRedis: false
+                  isPostgres:
+                    img.includes('postgres') || img.includes('timescale') || sName.includes('db'),
+                  isKafka:
+                    img.includes('kafka') ||
+                    img.includes('bitnami/kafka') ||
+                    sName.includes('queue'),
+                  isRedis: false,
                 });
               }
             }
@@ -1147,9 +1193,11 @@ export class E2EOrchestrator {
       }
     }
 
-    const portsArray = infraPorts.map(i => i.port).sort((a, b) => a - b);
+    const portsArray = infraPorts.map((i) => i.port).sort((a, b) => a - b);
     if (portsArray.length > 0) {
-      console.log(`⏳ Waiting for Ports: [${[...new Set(portsArray)].join(', ')}] (Concurrently)...`);
+      console.log(
+        `⏳ Waiting for Ports: [${[...new Set(portsArray)].join(', ')}] (Concurrently)...`,
+      );
     }
 
     // Helper to run shell commands asynchronously without blocking the event loop
@@ -1172,25 +1220,32 @@ export class E2EOrchestrator {
       infraPorts.map(async (info) => {
         const { port, serviceName, dir, isMongo, isPostgres, isKafka } = info;
         let ready = false;
-        
+
         for (let i = 0; i < 30; i++) {
           try {
             // 1. Check TCP Port
             await execAsync(`nc -z -w 1 127.0.0.1 ${port}`);
 
             // 2. Fetch Container ID
-            const containerId = await execAsync(`docker compose ps -q ${serviceName} | head -1`, dir);
-            
+            const containerId = await execAsync(
+              `docker compose ps -q ${serviceName} | head -1`,
+              dir,
+            );
+
             // 3. Deep Probes
             if (containerId) {
               if (isPostgres) {
                 await execAsync(`docker exec -w / ${containerId} pg_isready -U postgres`);
               }
               if (isMongo) {
-                await execAsync(`docker exec -w / ${containerId} sh -c 'mongosh -u root -p root --authenticationDatabase admin --quiet --eval "db.adminCommand(\\"ping\\")"'`);
+                await execAsync(
+                  `docker exec -w / ${containerId} sh -c 'mongosh -u root -p root --authenticationDatabase admin --quiet --eval "db.adminCommand(\\"ping\\")"'`,
+                );
               }
               if (isKafka) {
-                await execAsync(`docker exec -w / ${containerId} kafka-topics.sh --bootstrap-server localhost:9092 --list`);
+                await execAsync(
+                  `docker exec -w / ${containerId} kafka-topics.sh --bootstrap-server localhost:9092 --list`,
+                );
               }
             }
 
@@ -1200,10 +1255,13 @@ export class E2EOrchestrator {
             await new Promise((r) => setTimeout(r, 1000));
           }
         }
-        
+
         if (ready) console.log(`   ✅ Port ${port} (${serviceName}) is fully ready.`);
-        else console.warn(`   ⚠️  Port ${port} (${serviceName}) still warming up, proceeding with caution...`);
-      })
+        else
+          console.warn(
+            `   ⚠️  Port ${port} (${serviceName}) still warming up, proceeding with caution...`,
+          );
+      }),
     );
 
     this._startDockerLogCapture();
@@ -1341,8 +1399,8 @@ export class E2EOrchestrator {
       }
       console.log('⚡ Warm start + Seq: respawning services for log capture (build skipped)...');
       for (const [name, svc] of Object.entries(composeServices)) {
-         this._needsRestart.add(name); 
-         this.killProcessesOnPorts(svc.ports); // Kill them now since setupWorktrees left them alone
+        this._needsRestart.add(name);
+        this.killProcessesOnPorts(svc.ports); // Kill them now since setupWorktrees left them alone
       }
     }
 
@@ -1480,7 +1538,7 @@ export class E2EOrchestrator {
         this.writePhysicalEnvFile(worktreeDir, mergedEnv);
 
         console.log(`   [START] ${name}: ${svc.command!}`);
-        
+
         // ---> FIX: Prepend 'exec ' so Node replaces the shell
         const proc = Bun.spawn(['sh', '-c', `exec ${svc.command!}`], {
           cwd: worktreeDir,
@@ -1545,14 +1603,15 @@ export class E2EOrchestrator {
   }
 
   private async pollHealthCheck(name: string, url: string): Promise<void> {
-    const maxAttempts = 60;
+    const maxAttempts = 360; // Increased attempts to account for faster polling
     for (let attempt = 1; attempt <= maxAttempts; attempt++) {
       try {
-        await axios.get(url, { timeout: 3000 });
+        await axios.get(url, { timeout: 1000 }); // Fail fast if unresponsive
         console.log(`   ✅ Ready: ${name} (${url})`);
         return;
       } catch {
-        await new Promise((r) => setTimeout(r, 2000));
+        // ---> FIX: Poll every 500ms instead of 2000ms <---
+        await new Promise((r) => setTimeout(r, 500));
       }
     }
     throw new Error(`❌ Healthcheck failed after ${maxAttempts} attempts: ${name} (${url})`);
@@ -1574,15 +1633,19 @@ export class E2EOrchestrator {
    *   await orchestrator.ensureReady(api, BILLING_URL, GAME_URL, SERVICE_SIGNATURE, TARGET_GAME_CODE);
    */
   async ensureReady(
-    api: any, billingUrl: string, gameUrl: string, serviceSignature: any, targetGameCode: string,
+    api: any,
+    billingUrl: string,
+    gameUrl: string,
+    serviceSignature: any,
+    targetGameCode: string,
   ): Promise<void> {
     const state = this._loadReadyState();
-    
+
     if (state) {
       console.log('\n⚡ [Super Optimistic] Bypassing blocks. Executing tests instantly.\n');
       this._warmStart = true;
       this._startDockerLogCapture();
-      
+
       // Fire validations entirely in the background while tests are running
       this._bgValidation = this._runSuperOptimisticValidation(state);
       return;
@@ -1626,9 +1689,12 @@ export class E2EOrchestrator {
         .map(([repoKey, repo]) => {
           const isExplicitRemote = repo.target.startsWith('origin/');
           return {
-            repoKey, repoPath: path.resolve(repo.repoPath), target: repo.target,
+            repoKey,
+            repoPath: path.resolve(repo.repoPath),
+            target: repo.target,
             branchName: isExplicitRemote ? repo.target.substring(7) : repo.target,
-            isExplicitRemote, targetDir: path.join(this.worktreeBase, repoKey),
+            isExplicitRemote,
+            targetDir: path.join(this.worktreeBase, repoKey),
           };
         });
 
@@ -1636,43 +1702,58 @@ export class E2EOrchestrator {
       for (const { repoPath, branchName } of branches) {
         const key = `${repoPath}::${branchName}`;
         if (!seen.has(key)) {
-          seen.set(key, this.runAsyncOutput(`git ls-remote origin refs/heads/${branchName}`, repoPath)
+          seen.set(
+            key,
+            this.runAsyncOutput(`git ls-remote origin refs/heads/${branchName}`, repoPath)
               .then((out) => out.split('\n')[0]?.split('\t')[0]?.trim() || null)
-              .catch(() => null));
+              .catch(() => null),
+          );
         }
       }
 
-      for (const { repoKey, targetDir, target, branchName, isExplicitRemote, repoPath } of branches) {
+      for (const {
+        repoKey,
+        targetDir,
+        target,
+        branchName,
+        isExplicitRemote,
+        repoPath,
+      } of branches) {
         const remoteSha = await seen.get(`${repoPath}::${branchName}`)!;
         if (!remoteSha) continue;
-        const headSha = await this.runAsyncOutput('git log -1 --format=%H HEAD', targetDir).catch(() => '');
+        const headSha = await this.runAsyncOutput('git log -1 --format=%H HEAD', targetDir).catch(
+          () => '',
+        );
 
         if (headSha !== remoteSha) {
           if (isExplicitRemote) {
             logBg(`⚠️  [bg-validation] ${repoKey} @ ${target}: remote moved.`);
             throw new Error('Remote branch moved');
           } else {
-            const mergeBase = await this.runAsyncOutput(`git merge-base HEAD ${remoteSha}`, targetDir).catch(() => null);
+            const mergeBase = await this.runAsyncOutput(
+              `git merge-base HEAD ${remoteSha}`,
+              targetDir,
+            ).catch(() => null);
             if (mergeBase === headSha) {
               logBg(`⚠️  [bg-validation] ${repoKey} @ ${target}: remote has new commits.`);
               throw new Error('Remote branch moved');
             }
           }
         } else {
-           logBg(`✓  [bg-validation] ${repoKey} @ ${target}: up-to-date (${headSha.slice(0, 8)})`);
+          logBg(`✓  [bg-validation] ${repoKey} @ ${target}: up-to-date (${headSha.slice(0, 8)})`);
         }
       }
     } catch (e) {
       // ---> THE FIX <---
       // Delete the ready state so the next run knows to execute a Cold Start
       this._deleteReadyState();
-      
-      // Because this promise floats in the background, throwing here causes an 
+
+      // Because this promise floats in the background, throwing here causes an
       // Unhandled Promise Rejection which kills the test suite BEFORE `afterAll` runs.
       // We MUST write the marker file right here so the Bash wrapper knows to restart.
       fs.writeFileSync(path.resolve('logs/.rerun-needed'), '');
-      
-      throw e; 
+
+      throw e;
     }
   }
 
@@ -2127,29 +2208,36 @@ export class E2EOrchestrator {
     }
 
     if (toFlushRedis.size === 0) return;
-    
+
     console.log('\n🧹 Flushing Redis namespaces...');
-    
+
     // Dynamically find Redis containers from the deployed compose files
     const redisContainers = new Set<string>();
     const seenRepoPaths = new Set<string>();
-    
+
     for (const [repoName, repo] of Object.entries(orchestratorCfg.repos)) {
       const repoPath = path.resolve(repo.repoPath);
       if (seenRepoPaths.has(repoPath)) continue;
       seenRepoPaths.add(repoPath);
-      
+
       const dir = path.join(this.worktreeBase, repoName);
       const composeFile = path.join(dir, 'docker-compose.yml');
       if (!fs.existsSync(composeFile)) continue;
-      
+
       try {
         const doc = parseYaml(fs.readFileSync(composeFile, 'utf-8')) as any;
         if (doc?.services) {
           for (const [svcName, svc] of Object.entries<any>(doc.services)) {
             const img = String(svc.image || '').toLowerCase();
-            if (img.includes('redis') || img.includes('valkey') || svcName.toLowerCase().includes('redis')) {
-              const cid = execSync(`docker compose ps -q ${svcName} | head -1`, { cwd: dir, encoding: 'utf-8' }).trim();
+            if (
+              img.includes('redis') ||
+              img.includes('valkey') ||
+              svcName.toLowerCase().includes('redis')
+            ) {
+              const cid = execSync(`docker compose ps -q ${svcName} | head -1`, {
+                cwd: dir,
+                encoding: 'utf-8',
+              }).trim();
               if (cid) redisContainers.add(cid);
             }
           }
@@ -2164,7 +2252,7 @@ export class E2EOrchestrator {
 
     for (const prefix of toFlushRedis) {
       console.log(`   -> Scanning Redis instance(s) for prefix: ${prefix}:*`);
-      
+
       const script = `#!/bin/sh
 c="redis-cli"
 valkey-cli -v >/dev/null 2>&1 && c="valkey-cli"
@@ -2226,19 +2314,23 @@ exit 0
       for (const cid of redisContainers) {
         try {
           execSync(`docker cp ${scriptPath} ${cid}:/tmp/flush.sh`, { stdio: 'ignore' });
-          
+
           // ---> FIX: Added -w /tmp to prevent the OCI Breakout error <---
           const output = execSync(`docker exec -w /tmp ${cid} sh /tmp/flush.sh`);
-          
+
           const text = output.toString().trim();
           if (text) console.log(text);
         } catch (e: any) {
-          console.warn(`   ⚠️  Failed to clear Redis prefix ${prefix}:* on container ${cid.slice(0,8)}`);
+          console.warn(
+            `   ⚠️  Failed to clear Redis prefix ${prefix}:* on container ${cid.slice(0, 8)}`,
+          );
           const errMsg = e.stderr?.toString().trim() || e.stdout?.toString().trim() || e.message;
           console.warn(`      Error: ${errMsg}`);
         }
       }
-      try { fs.unlinkSync(scriptPath); } catch {}
+      try {
+        fs.unlinkSync(scriptPath);
+      } catch {}
     }
   }
 
