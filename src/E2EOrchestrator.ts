@@ -1061,62 +1061,90 @@ export class E2EOrchestrator {
       }),
     );
 
-    // Map the internal ports to your actual LOCAL ports defined in your .env/compose
-    // ---> FIX: Add 6000 (Redis) to the wait list <---
-    console.log('⏳ Waiting for Databases and Kafka to accept connections...');
-    const portsToWait = [5437, 27017, 9093, 6000];
+    // ---> DYNAMIC PORT DETECTION <---
+    console.log('⏳ Dynamically parsing Infrastructure Ports to accept connections...');
+    
+    interface InfraPort {
+      port: number;
+      serviceName: string;
+      repoName: string;
+      dir: string;
+      isMongo: boolean;
+      isPostgres: boolean;
+      isKafka: boolean;
+      isRedis: boolean;
+    }
+    
+    const infraPorts: InfraPort[] = [];
 
-    for (const port of portsToWait) {
+    // Parse the Compose files we just deployed
+    for (const repoName of infraRepos) {
+      const dir = path.join(this.worktreeBase, repoName);
+      const composeFile = path.join(dir, 'docker-compose.yml');
+      if (!fs.existsSync(composeFile)) continue;
+      
+      const content = fs.readFileSync(composeFile, 'utf-8');
+      const doc = parseYaml(content) as any;
+      
+      if (doc?.services) {
+        for (const [svcName, svc] of Object.entries<any>(doc.services)) {
+          if (svc.ports) {
+            for (const p of svc.ports) {
+              const hostP = parseInt(String(p).split(':')[0], 10);
+              if (hostP && !isNaN(hostP)) {
+                const img = String(svc.image || '').toLowerCase();
+                const sName = svcName.toLowerCase();
+                infraPorts.push({
+                  port: hostP,
+                  serviceName: svcName,
+                  repoName,
+                  dir,
+                  isMongo: img.includes('mongo') || sName.includes('mongo'),
+                  isPostgres: img.includes('postgres') || img.includes('timescale') || sName.includes('db'),
+                  isKafka: img.includes('kafka') || img.includes('bitnami/kafka') || sName.includes('queue'),
+                  isRedis: img.includes('redis') || img.includes('valkey') || sName.includes('redis'),
+                });
+              }
+            }
+          }
+        }
+      }
+    }
+
+    const portsArray = infraPorts.map(i => i.port).sort((a, b) => a - b);
+    if (portsArray.length > 0) {
+      console.log(`⏳ Waiting for Ports: [${[...new Set(portsArray)].join(', ')}]...`);
+    }
+
+    for (const info of infraPorts) {
+      const { port, serviceName, dir, isMongo, isPostgres, isKafka, isRedis } = info;
       let ready = false;
+      
       for (let i = 0; i < 30; i++) {
         try {
           execSync(`nc -z -w 1 127.0.0.1 ${port}`, { stdio: 'ignore' });
 
-          // Deeper readiness probes — port open ≠ service ready.
-          if (port === 5437) {
-            execSync(`docker exec $(docker ps -q -f "name=db-1") pg_isready -U postgres`, { stdio: 'ignore' });
-          }
-
-          // ---> ADD THIS MONGO PROBE <---
-          if (port === 27017) {
-            const mongoContainer = execSync(
-              "docker ps -q -f 'name=mongo' | head -1",
-              { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }
-            ).trim();
-            if (mongoContainer) {
-              // Wait until mongosh can actually authenticate and ping the admin DB
-              execSync(
-                `docker exec ${mongoContainer} sh -c 'mongosh -u root -p root --authenticationDatabase admin --quiet --eval "db.adminCommand(\\"ping\\")"'`,
-                { stdio: 'ignore' }
-              );
+          // Securely fetch exact container ID belonging to this specific compose project
+          const containerId = execSync(`docker compose ps -q ${serviceName} | head -1`, { cwd: dir, encoding: 'utf-8' }).trim();
+          
+          if (containerId) {
+            if (isPostgres) {
+              execSync(`docker exec ${containerId} pg_isready -U postgres`, { stdio: 'ignore' });
             }
-          }
 
-          if (port === 9093) {
-            // TCP open ≠ Kafka broker ready. Probe with kafka-topics.sh to confirm the
-            // broker has elected a controller and is ready for real connections.
-            // Kafka accepts TCP handshakes but resets them (ECONNRESET) until fully up.
-            const kafkaContainer = execSync(
-              "docker ps --format '{{.Names}}' | grep kafka-region | head -1",
-              { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] },
-            ).trim();
-            if (kafkaContainer) {
-              execSync(
-                `docker exec ${kafkaContainer} kafka-topics.sh --bootstrap-server localhost:9092 --list`,
-                { stdio: 'ignore' },
-              );
+            if (isMongo) {
+              execSync(`docker exec ${containerId} sh -c 'mongosh -u root -p root --authenticationDatabase admin --quiet --eval "db.adminCommand(\\"ping\\")"'`, { stdio: 'ignore' });
             }
-          }
 
-          if (port === 6000) {
-            const redisContainer = execSync(
-              "docker ps -q -f 'name=redis' | head -1",
-              { encoding: 'utf-8', stdio: ['pipe', 'pipe', 'ignore'] }
-            ).trim();
-            if (redisContainer) {
-              // Wait until the cluster is fully formed and strictly returns "cluster_state:ok"
+            if (isKafka) {
+              execSync(`docker exec ${containerId} kafka-topics.sh --bootstrap-server localhost:9092 --list`, { stdio: 'ignore' });
+            }
+
+            if (isRedis) {
+              // Gracefully handle cluster vs standalone AND dynamic internal ports
+              // Uses standard grep to prevent Alpine SIGPIPE early-exit crashes
               execSync(
-                `docker exec ${redisContainer} sh -c 'cli=$(which valkey-cli >/dev/null 2>&1 && echo valkey-cli || echo redis-cli); $cli -p 6000 cluster info | grep cluster_state:ok'`,
+                `docker exec ${containerId} sh -c 'cli="redis-cli"; valkey-cli -v >/dev/null 2>&1 && cli="valkey-cli"; p=""; $cli ping >/dev/null 2>&1 || p="-p ${port}"; if $cli $p info cluster 2>/dev/null | grep "cluster_enabled:1" >/dev/null; then $cli $p cluster info 2>/dev/null | grep "cluster_state:ok" >/dev/null; else $cli $p ping >/dev/null 2>&1; fi'`,
                 { stdio: 'ignore' }
               );
             }
@@ -1128,8 +1156,9 @@ export class E2EOrchestrator {
           await new Promise((r) => setTimeout(r, 1000));
         }
       }
-      if (ready) console.log(`   ✅ Port ${port} is fully ready.`);
-      else console.warn(`   ⚠️  Port ${port} still warming up, proceeding with caution...`);
+      
+      if (ready) console.log(`   ✅ Port ${port} (${serviceName}) is fully ready.`);
+      else console.warn(`   ⚠️  Port ${port} (${serviceName}) still warming up, proceeding with caution...`);
     }
 
     this._startDockerLogCapture();
@@ -2053,55 +2082,84 @@ export class E2EOrchestrator {
     if (toFlushRedis.size > 0) {
       console.log('\n🧹 Flushing Redis namespaces...');
       try {
-        const containerId = execSync(`docker ps -q -f "name=redis" | head -n 1`).toString().trim();
-        if (containerId) {
+        const containerIds = execSync(`docker ps -q -f "name=redis" -f "name=valkey"`).toString().trim().split('\n').filter(Boolean);
+        if (containerIds.length > 0) {
+          
           for (const prefix of toFlushRedis) {
-            console.log(`   -> Scanning Redis cluster for prefix: ${prefix}:*`);
+            console.log(`   -> Scanning Redis instance(s) for prefix: ${prefix}:*`);
 
-            // Clean multi-line bash script that tallies and prints every key found
+            // This script auto-detects internal ports, cluster state, and flushes correctly.
+            // It explicitly uses robust CLI detection and forces exit 0 so minor errors don't crash Node.
             const script = `
-              cli=$(which valkey-cli >/dev/null 2>&1 && echo valkey-cli || echo redis-cli)
+              cli="redis-cli"
+              valkey-cli -v >/dev/null 2>&1 && cli="valkey-cli"
+              
+              # Auto-detect working port (try default 6379, then fallback to common custom ports)
+              p=""
+              if $cli ping >/dev/null 2>&1; then p=""
+              elif $cli -p 6000 ping >/dev/null 2>&1; then p="-p 6000"
+              elif $cli -p 6001 ping >/dev/null 2>&1; then p="-p 6001"
+              elif $cli -p 6380 ping >/dev/null 2>&1; then p="-p 6380"
+              fi
+              
               total=0
-              for master in $($cli -p 6000 cluster nodes 2>/dev/null | grep master | awk '{print $2}' | cut -d@ -f1); do
-                host=$(echo $master | cut -d: -f1)
-                port=$(echo $master | cut -d: -f2)
-                keys=$($cli -h $host -p $port --scan --pattern "${prefix}:*" 2>/dev/null)
-                
+              
+              # Use standard grep to avoid SIGPIPE early-exit crashes in Alpine
+              if $cli $p info cluster 2>/dev/null | grep "cluster_enabled:1" >/dev/null; then
+                # --- CLUSTER MODE ---
+                for master in $($cli $p cluster nodes 2>/dev/null | awk '/master/ {print $2}' | cut -d@ -f1); do
+                  host=$(echo $master | cut -d: -f1)
+                  port=$(echo $master | cut -d: -f2)
+                  keys=$($cli -h $host -p $port --scan --pattern "${prefix}:*" 2>/dev/null)
+                  if [ -n "$keys" ]; then
+                    for key in $keys; do
+                      echo "      🗑️  Found: $key"
+                      total=$((total + 1))
+                    done
+                    echo "$keys" | xargs -n 50 $cli -h $host -p $port DEL >/dev/null 2>&1
+                  fi
+                done
+              else
+                # --- STANDALONE MODE ---
+                keys=$($cli $p --scan --pattern "${prefix}:*" 2>/dev/null)
                 if [ -n "$keys" ]; then
                   for key in $keys; do
                     echo "      🗑️  Found: $key"
                     total=$((total + 1))
                   done
-                  # Delete the keys
-                  echo "$keys" | xargs $cli -h $host -p $port DEL >/dev/null 2>&1
+                  echo "$keys" | xargs -n 50 $cli $p DEL >/dev/null 2>&1
                 fi
-              done
+              fi
               
               if [ "$total" -gt 0 ]; then
                 echo "   ✅ Successfully deleted $total keys for prefix ${prefix}:*"
               else
                 echo "   ℹ️  No existing keys found for prefix ${prefix}:*"
               fi
+              
+              exit 0
             `;
 
+            const primaryContainer = containerIds[0];
             try {
-              // Capture the stdout buffer and print it so you see the exact keys and the total!
-              const output = execSync(`docker exec -i ${containerId} sh`, {
+              const output = execSync(`docker exec -i ${primaryContainer} sh`, {
                 input: script,
                 stdio: ['pipe', 'pipe', 'pipe'],
               });
               console.log(output.toString().replace(/\n$/, ''));
             } catch (e: any) {
               console.warn(`   ⚠️  Failed to clear Redis prefix ${prefix}:*`);
-              // ---> FIX: Fallback to e.message if stderr is empty <---
+              // Extract stdout as well, since shell script errors often dump to stdout instead of stderr
+              const errOut = e.stdout ? e.stdout.toString().trim() : '';
               const errMsg = e.stderr ? e.stderr.toString().trim() : '';
-              console.warn(`      Error: ${errMsg || e.message || 'Unknown error'}`);
+              console.warn(`      Error: ${errMsg || errOut || e.message || 'Unknown error'}`);
             }
           }
         }
       } catch (e: any) {
         console.warn('   ⚠️  Failed to execute Redis flush.');
-        if (e.stderr) console.warn(`      Error: ${e.stderr.toString().trim()}`);
+        const errMsg = e.stderr ? e.stderr.toString().trim() : '';
+        console.warn(`      Error: ${errMsg || e.message || 'Failed to list containers'}`);
       }
     }
   }

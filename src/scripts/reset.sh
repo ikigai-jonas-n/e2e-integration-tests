@@ -5,33 +5,45 @@ set -euo pipefail
 
 WORKTREE_BASE=".e2e-worktrees"
 
-echo "🛑 Killing service processes..."
-for port in 7001 8070 8080 8090 8091 9000 19080; do
-  pids=$(lsof -P -n -ti:"$port" -sTCP:LISTEN 2>/dev/null || true)
-  if [ -n "$pids" ]; then
-    echo "   Killing port $port (PID $pids)"
-    echo "$pids" | xargs kill -9 2>/dev/null || true
-  fi
-done
+echo "🛑 Dynamically detecting service ports..."
+# Use Bun to dynamically parse the YAML and extract all exposed Node.js ports
+PORTS=$(bun -e "
+const yaml = require('yaml');
+const fs = require('fs');
+try {
+  const doc = yaml.parse(fs.readFileSync('src/docker-compose.services.yml', 'utf8'));
+  const ports = Object.values(doc.services).flatMap(s => s.ports || []).map(p => p.split(':')[0]);
+  console.log(ports.join(' '));
+} catch(e) {}
+")
+
+if [ -n "$PORTS" ]; then
+  echo "   Killing processes on ports: $PORTS"
+  for port in $PORTS; do
+    pids=$(lsof -P -n -ti:"$port" -sTCP:LISTEN 2>/dev/null || true)
+    if [ -n "$pids" ]; then
+      echo "   Killing port $port (PID $pids)"
+      echo "$pids" | xargs kill -9 2>/dev/null || true
+    fi
+  done
+fi
 
 echo "🐳 Stopping Docker Compose Projects..."
-# FIX: Dynamically loop through ANY folder inside the worktree base
 for compose_file in "$WORKTREE_BASE"/*/docker-compose.yml; do
   if [ -f "$compose_file" ]; then
     docker compose -f "$compose_file" down -v --remove-orphans --timeout 5 2>/dev/null || true
   fi
 done
-
 if [ -f "src/docker-compose.observability.yml" ]; then
   docker compose -f src/docker-compose.observability.yml down -v --timeout 5 2>/dev/null || true
 fi
 
-echo "🐳 Annihilating Orphaned Containers..."
-# FIX: Added redis and rustfs to the target list
-TARGETS=$(docker ps -a -q -f "name=mongo" -f "name=game" -f "name=queue" -f "name=rgs" -f "name=slot" -f "name=seq" -f "name=dozzle" -f "name=redis" -f "name=rustfs")
+echo "🐳 Annihilating Orphaned Test Containers..."
+# SAFER FALLBACK: Only target containers whose Docker Compose working directory label contains .e2e-worktrees
+TARGETS=$(docker ps -a --filter "label=com.docker.compose.project.working_dir" --format "{{.ID}} {{.Label \"com.docker.compose.project.working_dir\"}}" | grep "\.e2e-worktrees" | awk '{print $1}')
 
 if [ -n "$TARGETS" ]; then
-  echo "   Force-removing test containers..."
+  echo "   Force-removing orphaned E2E containers..."
   echo "$TARGETS" | xargs docker rm -f -v >/dev/null 2>&1 || true
 fi
 
@@ -46,14 +58,10 @@ if [ -d "$WORKTREE_BASE" ]; then
     fi
   done
   
-  # --- ASYNCHRONOUS DELETION OPTIMIZATION ---
+  # Delete asynchronously so your terminal is freed instantly
   echo "   Deleting $WORKTREE_BASE (natively in background)..."
-  
-  # Move the folder to a temp name instantly (takes 1 millisecond)
   TMP_TRASH=".e2e-trash-$(date +%s)"
   mv "$WORKTREE_BASE" "$TMP_TRASH" 2>/dev/null || true
-  
-  # Delete the temp folder quietly in the background, freeing up your terminal immediately
   (rm -rf "$TMP_TRASH" &)
 fi
 
