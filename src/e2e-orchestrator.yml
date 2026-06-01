@@ -68,7 +68,8 @@ repos:
 
   remote-game-server-bridge:
     repoPath: "../remote-game-server"
-    target: "origin/main"                         # bridge
+    # target: "origin/main"
+    target: "fix-bridge-version-mismatch"                         # bridge
     alwaysRedoMigration: false
     migrationEnvFile: ".env.billing.example"  # bridge env has no DB credentials
     skipMigration: true
