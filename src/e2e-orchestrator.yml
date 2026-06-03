@@ -36,7 +36,7 @@ repos:
 
   slot-game-server:
     repoPath: "../slot-game-server"
-    target: "sprint/1.15/base"
+    target: "fix-sexyfruits-screen-generation"
 
   # remote-game-server — one worktree per version
   # services sharing the same worktree key share a single build (npm install + build runs once)
@@ -61,23 +61,23 @@ repos:
 
   remote-game-server-billing:
     repoPath: "../remote-game-server"
-    target: "origin/main"                        # billing
+    target: "LG0-1858"                        # billing
     alwaysRedoMigration: false
     # uses billing env by default — has all DB credentials
     # DB_NAME=slot, MONGO_NAME=rgs (defaults from .env.billing.example)
 
   remote-game-server-bridge:
     repoPath: "../remote-game-server"
-    # target: "origin/main"
-    target: "fix-bridge-version-mismatch"                         # bridge
+    target: "LG0-1858"
+    # target: "fix-bridge-version-mismatch"                         # bridge
     alwaysRedoMigration: false
     migrationEnvFile: ".env.billing.example"  # bridge env has no DB credentials
     skipMigration: true
 
   remote-game-server-game:
     repoPath: "../remote-game-server"
-    target: "origin/main"                        # game
-    alwaysRedoMigration: false
+    target: "LG0-1858"                        # game
+    alwaysRedoMigration: true
     migrationEnvFile: ".env.billing.example"  # game env may lack postgres credentials
 
 # Observability tools started automatically alongside infra.

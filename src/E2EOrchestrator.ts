@@ -771,7 +771,7 @@ export class E2EOrchestrator {
                 ? currentBranch === 'HEAD' // Explicit remote should be a detached HEAD
                 : currentBranch === branchName; // Local target should be on the actual branch
 
-              const lsKey = `${repoPath}::${branchName}`;
+              const lsKey = `${repoName}::${branchName}`;
               if (!pendingBranchChecks.has(lsKey)) {
                 pendingBranchChecks.set(
                   lsKey,
@@ -2373,117 +2373,117 @@ exit 0
    * Swagger detection: probes common swagger UI paths concurrently. Fast (800ms timeout,
    * all services in parallel). Shows link only when the endpoint actually responds.
    */
-    private async printEnvironmentSummary() {
-      const portedServices = Object.entries(composeServices).filter(
-        ([, s]) => s['x-repo'] && hostPort(s.ports),
-      );
-      const baseUrls = portedServices.map(([, s]) => `http://127.0.0.1:${hostPort(s.ports)}`);
+  private async printEnvironmentSummary() {
+    const portedServices = Object.entries(composeServices).filter(
+      ([, s]) => s['x-repo'] && hostPort(s.ports),
+    );
+    const baseUrls = portedServices.map(([, s]) => `http://127.0.0.1:${hostPort(s.ports)}`);
 
-      // Probe swagger concurrently while we build the table — fire immediately
-      const swaggerPromise = this._probeSwaggerUrls([...new Set(baseUrls)]);
+    // Probe swagger concurrently while we build the table — fire immediately
+    const swaggerPromise = this._probeSwaggerUrls([...new Set(baseUrls)]);
 
-      const endpoints: Record<string, string> = {};
-      const postmanValues: { key: string; value: string; type: string; enabled: boolean }[] = [];
+    const endpoints: Record<string, string> = {};
+    const postmanValues: { key: string; value: string; type: string; enabled: boolean }[] = [];
 
-      // Collect rows
-      const rows: Array<{
-        service: string;
-        repo: string;
-        target: string;
-        port: string;
-        db: string;
-        url: string;
-        swagger: string;
-      }> = [];
+    // Collect rows
+    const rows: Array<{
+      service: string;
+      repo: string;
+      target: string;
+      port: string;
+      db: string;
+      url: string;
+      swagger: string;
+    }> = [];
 
-      for (const [name, svc] of Object.entries(composeServices)) {
-        const repo = svc['x-repo'];
-        if (!repo) continue;
-        const repoCfg = orchestratorCfg.repos[repo];
-        const { dbName } = this.deduceIsolatedNames(repo, repoCfg, svc);
-        const port = hostPort(svc.ports);
-        const url = port ? `http://127.0.0.1:${port}` : '-';
+    for (const [name, svc] of Object.entries(composeServices)) {
+      const repo = svc['x-repo'];
+      if (!repo) continue;
+      const repoCfg = orchestratorCfg.repos[repo];
+      const { dbName } = this.deduceIsolatedNames(repo, repoCfg, svc);
+      const port = hostPort(svc.ports);
+      const url = port ? `http://127.0.0.1:${port}` : '-';
 
-        if (port) {
-          endpoints[name] = url;
-          postmanValues.push({
-            key: name.toUpperCase().replace(/-/g, '_') + '_URL',
-            value: url,
-            type: 'default',
-            enabled: true,
-          });
-        }
-
-        // Placeholder — filled in after swagger probing resolves
-        rows.push({
-          service: name,
-          repo: repo.replace(/^remote-game-server-/, 'rgs-'),
-          target: repoCfg?.target ?? '-',
-          port: String(port ?? '-'),
-          db: dbName ?? '-',
-          url,
-          swagger: '…', // resolved below
+      if (port) {
+        endpoints[name] = url;
+        postmanValues.push({
+          key: name.toUpperCase().replace(/-/g, '_') + '_URL',
+          value: url,
+          type: 'default',
+          enabled: true,
         });
       }
 
-      // Await swagger probe results and fill in the swagger column
-      const swaggerMap = await swaggerPromise;
-      for (const r of rows) {
-        r.swagger = swaggerMap.get(r.url) ?? '-';
-      }
-
-      // Column widths
-      const w = {
-        service: Math.max(7, ...rows.map((r) => r.service.length)),
-        repo: Math.max(12, ...rows.map((r) => r.repo.length)),
-        target: Math.max(6, ...rows.map((r) => r.target.length)),
-        port: 5,
-        db: Math.max(8, ...rows.map((r) => r.db.length)),
-        url: Math.max(3, ...rows.map((r) => r.url.length)),
-        swagger: Math.max(7, ...rows.map((r) => r.swagger.length)),
-      };
-      const totalW = Object.values(w).reduce((a, b) => a + b, 0) + Object.keys(w).length * 3 - 1;
-      const bar = '─';
-      const col = (s: string, n: number) => s.padEnd(n);
-      const row = (r: (typeof rows)[0]) =>
-        `│ ${col(r.service, w.service)} │ ${col(r.repo, w.repo)} │ ${col(r.target, w.target)} │ ${col(r.port, w.port)} │ ${col(r.db, w.db)} │ ${col(r.url, w.url)} │ ${col(r.swagger, w.swagger)} │`;
-      const hdr = `│ ${col('Service', w.service)} │ ${col('Repo Variant', w.repo)} │ ${col('Target', w.target)} │ ${col('Port', w.port)} │ ${col('DB', w.db)} │ ${col('URL', w.url)} │ ${col('Swagger', w.swagger)} │`;
-      const sep = (l: string, m: string, r2: string) =>
-        l +
-        [w.service, w.repo, w.target, w.port, w.db, w.url, w.swagger]
-          .map((n) => bar.repeat(n + 2))
-          .join(m) +
-        r2;
-
-      console.log('\n🌍 Service Environment');
-      console.log(sep('┌', '┬', '┐'));
-      console.log(hdr);
-      console.log(sep('├', '┼', '┤'));
-      rows.forEach((r) => console.log(row(r)));
-      console.log(sep('└', '┴', '┘'));
-
-      const obs = orchestratorCfg.observability;
-      if (obs?.seq) console.log('   📈 Seq logs  →  http://localhost:8081');
-      if (obs?.dozzle) console.log('   🔍 Dozzle    →  http://localhost:9990');
-      console.log('');
-
-      // Write artifacts
-      fs.writeFileSync('./.e2e-endpoints.json', JSON.stringify(endpoints, null, 2));
-      fs.writeFileSync(
-        './E2E_Local.postman_environment.json',
-        JSON.stringify(
-          {
-            id: 'e2e-local-dev',
-            name: 'E2E Local Environment',
-            values: postmanValues,
-            _postman_variable_scope: 'environment',
-          },
-          null,
-          2,
-        ),
-      );
-      console.log('📦 Postman env → E2E_Local.postman_environment.json');
+      // Placeholder — filled in after swagger probing resolves
+      rows.push({
+        service: name,
+        repo: repo.replace(/^remote-game-server-/, 'rgs-'),
+        target: repoCfg?.target ?? '-',
+        port: String(port ?? '-'),
+        db: dbName ?? '-',
+        url,
+        swagger: '…', // resolved below
+      });
     }
+
+    // Await swagger probe results and fill in the swagger column
+    const swaggerMap = await swaggerPromise;
+    for (const r of rows) {
+      r.swagger = swaggerMap.get(r.url) ?? '-';
+    }
+
+    // Column widths
+    const w = {
+      service: Math.max(7, ...rows.map((r) => r.service.length)),
+      repo: Math.max(12, ...rows.map((r) => r.repo.length)),
+      target: Math.max(6, ...rows.map((r) => r.target.length)),
+      port: 5,
+      db: Math.max(8, ...rows.map((r) => r.db.length)),
+      url: Math.max(3, ...rows.map((r) => r.url.length)),
+      swagger: Math.max(7, ...rows.map((r) => r.swagger.length)),
+    };
+    const totalW = Object.values(w).reduce((a, b) => a + b, 0) + Object.keys(w).length * 3 - 1;
+    const bar = '─';
+    const col = (s: string, n: number) => s.padEnd(n);
+    const row = (r: (typeof rows)[0]) =>
+      `│ ${col(r.service, w.service)} │ ${col(r.repo, w.repo)} │ ${col(r.target, w.target)} │ ${col(r.port, w.port)} │ ${col(r.db, w.db)} │ ${col(r.url, w.url)} │ ${col(r.swagger, w.swagger)} │`;
+    const hdr = `│ ${col('Service', w.service)} │ ${col('Repo Variant', w.repo)} │ ${col('Target', w.target)} │ ${col('Port', w.port)} │ ${col('DB', w.db)} │ ${col('URL', w.url)} │ ${col('Swagger', w.swagger)} │`;
+    const sep = (l: string, m: string, r2: string) =>
+      l +
+      [w.service, w.repo, w.target, w.port, w.db, w.url, w.swagger]
+        .map((n) => bar.repeat(n + 2))
+        .join(m) +
+      r2;
+
+    console.log('\n🌍 Service Environment');
+    console.log(sep('┌', '┬', '┐'));
+    console.log(hdr);
+    console.log(sep('├', '┼', '┤'));
+    rows.forEach((r) => console.log(row(r)));
+    console.log(sep('└', '┴', '┘'));
+
+    const obs = orchestratorCfg.observability;
+    if (obs?.seq) console.log('   📈 Seq logs  →  http://localhost:8081');
+    if (obs?.dozzle) console.log('   🔍 Dozzle    →  http://localhost:9990');
+    console.log('');
+
+    // Write artifacts
+    fs.writeFileSync('./.e2e-endpoints.json', JSON.stringify(endpoints, null, 2));
+    fs.writeFileSync(
+      './E2E_Local.postman_environment.json',
+      JSON.stringify(
+        {
+          id: 'e2e-local-dev',
+          name: 'E2E Local Environment',
+          values: postmanValues,
+          _postman_variable_scope: 'environment',
+        },
+        null,
+        2,
+      ),
+    );
+    console.log('📦 Postman env → E2E_Local.postman_environment.json');
+  }
 
   /**
    * Writes the compiled environment object to a physical .env file in the worktree.

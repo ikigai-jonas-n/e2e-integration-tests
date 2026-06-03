@@ -8,6 +8,8 @@
     "test:raw": "bash src/scripts/run-tests.sh",
     "test:fast": "bash src/scripts/run-tests.sh --timeout 5000",
     "setup:env": "bun run src/scripts/dev-services.ts",
+    "logs": "bash src/scripts/tail-services.sh",
+    "logs:combined": "bash src/scripts/tail-services.sh --no-split",
     "reset": "bash src/scripts/reset.sh",
     "reset:hard": "bash src/scripts/reset.sh --hard",
     "lint": "bun run type:check && bun run prettier:check && bun run lint:code",

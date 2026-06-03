@@ -14,6 +14,7 @@ import { runServiceTests } from './specs/service.spec';
 
 // Flow specs (end-to-end lifecycle tests, each step depends on the previous)
 import { runBetAndActionFlow } from './specs/bet-n-action-flow.spec';
+import { runBridgeSyncBugTests } from './specs/bridge-flow-must-sync-all-games.spec';
 import { runBridgeFlowTests } from './specs/bridge-flow.spec';
 import { runLobbyFlowTests } from './specs/lobby-flow.spec';
 import { runMaintenanceFlowTests } from './specs/maintenance-flow.spec';
@@ -78,3 +79,4 @@ suite('flow-maintenance', 'Flow: Game Maintenance', runMaintenanceFlowTests);
 
 // Bridge flow last — it disables / re-enables LGS-004 (may affect cron state)
 suite('flow-bridge', 'Flow: Bridge & State Propagation', runBridgeFlowTests);
+suite('flow-bridge-must-sync-all-games', 'Flow: Brand New Game Sync', runBridgeSyncBugTests);
