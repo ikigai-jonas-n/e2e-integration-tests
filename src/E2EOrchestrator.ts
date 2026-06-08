@@ -1357,12 +1357,11 @@ export class E2EOrchestrator {
           this.createCappedMigrationDir(sourcePath, targetPath, repoCfg.untilMigrationFile);
         }
 
-        // REDO Logic - Triggered by YAML flushData, alwaysRedoMigration, or a cache-miss
-        // Notice this now cleanly checks target.name (e.g., slot_main) so it never wipes the wrong DB!
+        // REDO Logic - Triggered explicitly by YAML flushData or alwaysRedoMigration
+        // (Removed automatic wipe on repo change to drastically speed up incremental migrations)
         const targetNeedsRedo =
           repoCfg?.alwaysRedoMigration ||
-          targetsToRedo.has(target.name) ||
-          this._changedRepos.has(repo);
+          targetsToRedo.has(target.name);
 
         if (targetNeedsRedo) {
           console.log(`   -> [REDO] Wiping ${target.name}...`);
@@ -1459,16 +1458,18 @@ export class E2EOrchestrator {
                 console.log(`   [INFO] Using optimized cached install for ${repo}...`);
               }
 
-              // ---> FIX: Prepend 'exec ' so Node replaces the shell
               const proc = Bun.spawn(['sh', '-c', `exec ${finalCmd}`], {
                 cwd: worktreeDir,
                 env: mergedEnv as any,
+                stdout: 'pipe',
+                stderr: 'pipe',
               });
 
               await proc.exited;
               if (proc.exitCode !== 0) {
                 const err = await new Response(proc.stderr).text();
-                throw new Error(`Build failed for ${repo}: ${err}`);
+                const out = await new Response(proc.stdout).text();
+                throw new Error(`Build failed for ${repo}:\nSTDOUT: ${out}\nSTDERR: ${err}`);
               }
             }
             this.writeBuildCache(worktreeDir);

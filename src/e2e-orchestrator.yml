@@ -61,14 +61,14 @@ repos:
 
   remote-game-server-billing:
     repoPath: "../remote-game-server"
-    target: "LG0-1858"                        # billing
+    target: "LGRGS-487"                        # billing
     alwaysRedoMigration: false
     # uses billing env by default — has all DB credentials
     # DB_NAME=slot, MONGO_NAME=rgs (defaults from .env.billing.example)
 
   remote-game-server-bridge:
     repoPath: "../remote-game-server"
-    target: "LG0-1858"
+    target: "LGRGS-487"
     # target: "fix-bridge-version-mismatch"                         # bridge
     alwaysRedoMigration: false
     migrationEnvFile: ".env.billing.example"  # bridge env has no DB credentials
@@ -76,8 +76,8 @@ repos:
 
   remote-game-server-game:
     repoPath: "../remote-game-server"
-    target: "LG0-1858"                        # game
-    alwaysRedoMigration: true
+    target: "LGRGS-487"                        # game
+    alwaysRedoMigration: false
     migrationEnvFile: ".env.billing.example"  # game env may lack postgres credentials
 
 # Observability tools started automatically alongside infra.
