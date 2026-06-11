@@ -383,10 +383,10 @@ export class E2EOrchestrator {
       // FIX: Added aggressive exclusions for build artifacts, node_modules, and logs.
       // This prevents IDEs or linters from triggering a false-positive "dirty" state
       // if they touch ignored files.
-      // FIX: Aggressive exclusions for build artifacts and package.json to prevent 
-            // extraPackages injections from falsely triggering "source files changed"
-            const diffCmd =
-              'git diff HEAD -- ":(exclude)*docker-compose*" ":(exclude)*.env*" ":(exclude)node_modules/*" ":(exclude)build/*" ":(exclude)logs/*" ":(exclude).e2e-state.json" ":(exclude)package.json" ":(exclude)package-lock.json"';
+      // FIX: Aggressive exclusions for build artifacts and package.json to prevent
+      // extraPackages injections from falsely triggering "source files changed"
+      const diffCmd =
+        'git diff HEAD -- ":(exclude)*docker-compose*" ":(exclude)*.env*" ":(exclude)node_modules/*" ":(exclude)build/*" ":(exclude)logs/*" ":(exclude).e2e-state.json" ":(exclude)package.json" ":(exclude)package-lock.json"';
       const diff = execSync(diffCmd, { cwd: dir }).toString();
 
       // Include extraPackages in the hash so adding/removing them invalidates the cache.
@@ -763,9 +763,8 @@ export class E2EOrchestrator {
       if (!fs.existsSync(this.worktreeBase)) {
         fs.mkdirSync(this.worktreeBase, { recursive: true });
       }
-      console.log('🌳 Provisioning Git Worktrees (Concurrently)...');
+      console.log('🌳 Provisioning Git Worktrees (Optimistic Mode)...');
 
-      // ---> START OF FIX: Deduplicated & Auto-Healing Fetcher <---
       const uniqueFetchPromises = new Map<string, Promise<void>>();
       const safeFetch = (repoPath: string, executeDir: string) => {
         const key = path.resolve(repoPath);
@@ -774,7 +773,6 @@ export class E2EOrchestrator {
             key,
             (async () => {
               try {
-                // --force safely overwrites diverged remote branches, deduplication prevents lock contention
                 await this.runAsync('git fetch --all --tags --prune --force', executeDir);
               } catch (e: any) {
                 const msg = String(e.message || '');
@@ -782,7 +780,6 @@ export class E2EOrchestrator {
                   console.log(
                     `   -> ⚠️  Git lock conflict in ${path.basename(repoPath)}. Auto-healing refs...`,
                   );
-                  // Nuke broken refs/locks and retry safely
                   await this.runAsync('git pack-refs --all --prune', executeDir).catch(() => {});
                   await this.runAsync('git gc --prune=now', executeDir).catch(() => {});
                   await this.runAsync('git fetch --all --tags --prune --force', executeDir);
@@ -793,166 +790,77 @@ export class E2EOrchestrator {
             })(),
           );
         }
-        return uniqueFetchPromises.get(key)!; // Returns the shared promise
+        return uniqueFetchPromises.get(key)!;
       };
-      // ---> END OF FIX <---
 
-      // ── Optimistic provisioning ───────────────────────────────────────────────
-      // Strategy:
-      //   Tags (semver x.y.z): local comparison only — immutable, zero network.
-      //   Branches (main / feature/x): ls-remote fires in background immediately.
-      //
-      // Phase 1 (this block): local comparisons for all + report results instantly.
-      //   Tags resolve in ~10ms. Branches report ✓ optimistically if local matches.
-      //   ls-remote runs concurrently in background, not awaited yet.
-      //
-      // Phase 2 (detectWarmStart, called right after): await pending branch checks.
-      //   If remote SHA differs from local → fetch + checkout that repo.
-      //   Fetched repos → build cache miss → warm start disabled → cold start.
-      //   Nothing done twice: expensive work (infra, migrations) hasn't started yet.
       const isSemverTag = (t: string) => /^v?\d+\.\d+/.test(t);
 
-      // Fire all branch ls-remote Promises immediately, deduplicated by (repo, branch).
-      // They run concurrently while Phase 1 processes tags locally.
-      const pendingBranchChecks = new Map<
-        string,
-        Promise<{
-          repoName: string;
-          repoPath: string;
-          targetDir: string;
-          target: string;
-          branchName: string;
-          isExplicitRemote: boolean;
-          needsFetch: boolean;
-          hasRemote: boolean; // <-- ADD THIS
-        }>
-      >();
-
-      // ── Phase 1: local comparisons (instant) ─────────────────────────────────
       await Promise.all(
         Object.entries(orchestratorCfg.repos).map(async ([repoName, repo]) => {
           const targetDir = path.join(this.worktreeBase, repoName);
           const repoPath = path.resolve(repo.repoPath);
 
+          // 1. Is the worktree already created?
           if (fs.existsSync(path.join(targetDir, '.git'))) {
             const headSha = await this.runAsyncOutput(
               'git log -1 --format=%H HEAD',
               targetDir,
             ).catch(() => '');
 
-            if (isSemverTag(repo.target)) {
-              // Tag: local comparison only.
-              const localSha = await this.runAsyncOutput(
-                `git log -1 --format=%H ${repo.target}`,
-                repoPath,
-              ).catch(() => null);
-              if (localSha && headSha === localSha) {
-                console.log(`   -> ${repoName} @ ${repo.target} ✓ (${headSha.slice(0, 8)})`);
-                return;
-              }
-              // Local mismatch → fetch now.
-              console.log(`   -> Updating ${repoName} @ ${repo.target}...`);
-              await safeFetch(repoPath, targetDir);
-              try {
-                await this.runAsync(`git checkout --detach origin/${repo.target}`, targetDir);
-              } catch {
-                await this.runAsync(`git checkout --detach ${repo.target}`, targetDir);
-              }
-            } else {
-              // ── Intuitiveness & Customizability: Strict Local vs Remote tracking ──
-              const isExplicitRemote = repo.target.startsWith('origin/');
-              const branchName = isExplicitRemote ? repo.target.substring(7) : repo.target;
+            // 2. Resolve what SHA we EXPECT it to be based PURELY on local knowledge
+            const isExplicitRemote = repo.target.startsWith('origin/');
+            const branchName = isExplicitRemote ? repo.target.substring(7) : repo.target;
+            const refToResolve = isSemverTag(repo.target)
+              ? repo.target
+              : `${isExplicitRemote ? 'origin/' : ''}${branchName}`;
 
-              // Check if we have a local SHA first
-              let expectedSha: string | null = null;
-              if (!isExplicitRemote) {
-                expectedSha = await this.runAsyncOutput(
-                  `git rev-parse ${branchName}`,
-                  repoPath,
-                ).catch(() => null);
-              }
+            // FIX: 'git log' peels annotated tags down to their true commit SHA so the fast-path bypass works
+            const expectedSha = await this.runAsyncOutput(
+              `git log -1 --format=%H ${refToResolve}`,
+              repoPath,
+            ).catch(() => null);
 
-              const headMatchesTarget = !!expectedSha && headSha === expectedSha;
-
-              const lsKey = `${repoName}::${branchName}`;
-              if (!pendingBranchChecks.has(lsKey)) {
-                pendingBranchChecks.set(
-                  lsKey,
-                  (async () => {
-                    // ---> THE SPEED FIX: Skip network entirely if we have a local branch <---
-                    if (!isExplicitRemote && expectedSha) {
-                      return {
-                        repoName,
-                        repoPath,
-                        targetDir,
-                        target: repo.target,
-                        branchName,
-                        isExplicitRemote,
-                        needsFetch: !headMatchesTarget,
-                        hasRemote: false, // Skip all remote sync logic completely
-                      };
-                    }
-
-                    // Otherwise, hit the network to resolve it
-                    const out = await this.runAsyncOutput(
-                      `git ls-remote origin refs/heads/${branchName}`,
-                      repoPath,
-                    ).catch(() => '');
-                    const remoteSha = out.split('\n')[0]?.split('\t')[0]?.trim() || null;
-                    let needsFetch = false;
-
-                    if (isExplicitRemote) {
-                      needsFetch = !headMatchesTarget || (!!remoteSha && headSha !== remoteSha);
-                    } else {
-                      // Fallback: we wanted local but it didn't exist yet, rely on remote
-                      if (!headMatchesTarget || (remoteSha && headSha !== remoteSha)) {
-                        needsFetch = true;
-                      }
-                    }
-
-                    return {
-                      repoName,
-                      repoPath,
-                      targetDir,
-                      target: repo.target,
-                      branchName,
-                      isExplicitRemote,
-                      needsFetch,
-                      hasRemote: !!remoteSha,
-                    };
-                  })(),
-                );
-              }
-
-              if (headMatchesTarget) {
-                console.log(
-                  `   -> ${repoName} @ ${repo.target} ✓ (${headSha.slice(0, 8)}, verifying...)`,
-                );
-              } else {
-                console.log(`   -> ${repoName} switching to ${repo.target}...`);
-              }
+            // 3. OPTIMISTIC BYPASS:
+            // If it's a LOCAL branch, bypass the network entirely if SHAs match.
+            // If it's an EXPLICIT REMOTE (origin/), ignore the bypass and force a fetch.
+            if (!isExplicitRemote && expectedSha && headSha === expectedSha) {
+              console.log(`   -> ${repoName} @ ${repo.target} ✓ (${headSha.slice(0, 8)})`);
+              return;
             }
+
+            // 4. Missing or mismatched: Fetch & Checkout
+            console.log(`   -> Updating ${repoName} @ ${repo.target}...`);
+            await safeFetch(repoPath, targetDir);
+
+            const targetSha =
+              (await this.runAsyncOutput(`git rev-parse ${refToResolve}`, targetDir).catch(
+                () => null,
+              )) ??
+              (await this.runAsyncOutput(`git rev-parse origin/${branchName}`, targetDir).catch(
+                () => null,
+              ));
+
+            if (!targetSha) throw new Error(`Cannot resolve ref '${repo.target}'.`);
+            await this.runAsync(`git checkout --detach ${targetSha}`, targetDir);
           } else {
+            // Cold Provisioning: Worktree doesn't exist yet
             console.log(`   -> Checking out ${repoName} @ ${repo.target}...`);
             if (fs.existsSync(targetDir)) fs.rmSync(targetDir, { recursive: true, force: true });
+
             await safeFetch(repoPath, repoPath);
             try {
               await this.runAsync('git worktree prune', repoPath);
             } catch {}
 
-            // Handle initial checkout based on local/remote preference
             const isExplicitRemote = repo.target.startsWith('origin/');
             const branchName = isExplicitRemote ? repo.target.substring(7) : repo.target;
-
-            // FIX: Always detach worktrees to prevent locking the branch in your main repo.
-            // Use the resolved SHA to avoid ambiguity inside a worktree directory.
             const worktreeRef = isExplicitRemote ? `origin/${branchName}` : branchName;
+
             await this.runAsync(
               `git worktree add --detach ${targetDir} ${worktreeRef}`,
               repoPath,
             ).catch(async (err) => {
               if (!isExplicitRemote) {
-                // Fallback: If local branch truly doesn't exist yet, detach from remote
                 await this.runAsync(
                   `git worktree add --detach ${targetDir} origin/${branchName}`,
                   repoPath,
@@ -966,95 +874,10 @@ export class E2EOrchestrator {
           }
         }),
       );
-
-      // ── Phase 2: await branch remote checks ──────────────────────────────────
-      if (pendingBranchChecks.size > 0) {
-        const results = await Promise.all([...pendingBranchChecks.values()]);
-        const stale = results.filter((r) => r.needsFetch);
-
-        if (stale.length > 0) {
-          await Promise.all(
-            stale.map(
-              async ({
-                repoName,
-                targetDir,
-                target,
-                branchName,
-                isExplicitRemote,
-                hasRemote,
-                repoPath,
-              }) => {
-                console.log(`   -> ${repoName} @ ${target}: syncing with remote...`);
-                await safeFetch(repoPath, targetDir);
-                try {
-                  // ALWAYS resolve any ref to a raw SHA before calling `git checkout --detach`.
-                  // Inside a worktree, `--detach <branch-name>` or `--detach origin/<branch>`
-                  // fails with "does not take a path argument" because git treats the name as
-                  // a path relative to the worktree directory. Only raw SHAs are unambiguous.
-                  //
-                  // KEY: resolve refs against repoPath (the main repo), NOT targetDir (the worktree).
-                  // Remote tracking refs (origin/LGRGS-487) only live in the main .git directory.
-                  // Worktrees have a .git FILE (pointer), not a full .git directory with remotes.
-                  const resolveRef = async (ref: string): Promise<string | null> =>
-                    this.runAsyncOutput(`git rev-parse ${ref}`, repoPath).catch(() => null);
-
-                  // Resolution order for local branches:
-                  //   1. <branch>         — local branch (highest priority)
-                  //   2. origin/<branch>  — freshly fetched fallback
-                  let targetSha: string | null;
-                  if (isExplicitRemote) {
-                    targetSha = await resolveRef(`origin/${branchName}`);
-                  } else {
-                    targetSha =
-                      (await resolveRef(branchName)) ?? (await resolveRef(`origin/${branchName}`));
-                  }
-
-                  if (!targetSha) {
-                    throw new Error(
-                      `Cannot resolve ref '${branchName}' to a SHA. Make sure the branch exists locally or on origin.`,
-                    );
-                  }
-
-                  await this.runAsync(`git checkout --detach ${targetSha}`, targetDir);
-
-                  if (!isExplicitRemote && hasRemote) {
-                    // Fast-forward check: if local is behind remote after detach, log it
-                    // (we already detached to origin/ SHA above, so nothing extra to do)
-                    const localSha = await resolveRef(branchName);
-                    if (localSha && localSha !== targetSha) {
-                      console.log(
-                        `   -> ℹ️  ${repoName}: Detached to remote tip (local branch '${branchName}' is behind or diverged).`,
-                      );
-                    }
-                  } else if (!isExplicitRemote && !hasRemote) {
-                    console.log(
-                      `   -> ℹ️  ${repoName}: Local branch '${branchName}' is unpushed. Using local state.`,
-                    );
-                  }
-                } catch (e: any) {
-                  // Extract the real Git error message so it's not hidden
-                  const gitMsg =
-                    e.message.split('\n').slice(1).join(' ').trim() || e.message.split('\n')[0];
-                  console.log(
-                    `   -> ❌ ${repoName}: Failed to checkout ${target} (Git: ${gitMsg})`,
-                  );
-                  if (!hasRemote) {
-                    console.log(
-                      `   -> ℹ️  Tip: Make sure the branch is spelled correctly and exists in the main repo.`,
-                    );
-                  }
-                  throw e; // Halt the orchestrator so it doesn't run tests on the wrong code
-                }
-              },
-            ),
-          );
-        }
-      }
     }
 
     await this.detectWarmStart();
 
-    // ---> FIX: Only kill the ports of services we actually plan to restart <---
     if (this._needsRestart.size > 0) {
       const portsToKill = [...this._needsRestart]
         .flatMap((name) => composeServices[name]?.ports || [])
@@ -1066,7 +889,7 @@ export class E2EOrchestrator {
         for (const port of portsToKill) {
           try {
             execSync(
-              `lsof -P -n -i:${port} -sTCP:LISTEN | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`,
+              `lsof -P -n -i:${port} -sTCP:LISTEN 2>/dev/null | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`,
             );
           } catch {}
         }

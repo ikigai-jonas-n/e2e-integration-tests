@@ -32,7 +32,7 @@ global:
 repos:
   queue-service:
     repoPath: "../queue-service"
-    target: "origin/main"
+    target: "main"
 
   slot-game-server:
     repoPath: "../slot-game-server"
