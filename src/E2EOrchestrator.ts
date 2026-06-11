@@ -28,7 +28,10 @@ interface RepoConfig {
   skipMigration?: boolean;
   alwaysRedoMigration?: boolean;
   untilMigrationFile?: string;
-  flushData?: FlushDataConfig; // <-- ADDED
+  flushData?: FlushDataConfig;
+  /** Extra npm packages injected after `npm install`, before `npm run build`.
+   *  Sourced from e2e-local.override.yml — never from the committed config. */
+  extraPackages?: string[];
 }
 
 interface ObservabilityConfig {
@@ -62,6 +65,38 @@ interface ComposeService {
 const orchestratorCfg = parseYaml(
   readFileSync(path.resolve('./src/e2e-orchestrator.yml'), 'utf-8'),
 ) as OrchestratorConfig;
+
+// ─── Deep-merge local override (gitignored, machine-specific) ─────────────────
+// e2e-local.override.yml lets developers inject extraPackages into specific
+// repo worktrees without modifying package.json or the committed config.
+{
+  const overridePath = path.resolve('./src/e2e-local.override.yml');
+  if (fs.existsSync(overridePath)) {
+    const localOverride = parseYaml(
+      readFileSync(overridePath, 'utf-8'),
+    ) as Partial<OrchestratorConfig>;
+    if (localOverride?.repos) {
+      for (const [repoKey, overrideRepoCfg] of Object.entries(localOverride.repos)) {
+        if (orchestratorCfg.repos[repoKey]) {
+          // Merge only supported override fields — never overwrite target/repoPath
+          if (overrideRepoCfg.extraPackages?.length) {
+            orchestratorCfg.repos[repoKey].extraPackages = overrideRepoCfg.extraPackages;
+          }
+        } else {
+          console.warn(
+            `[e2e-local.override.yml] Unknown repo key "${repoKey}" — skipping. Valid keys: ${Object.keys(orchestratorCfg.repos).join(', ')}`,
+          );
+        }
+      }
+      const overriddenRepos = Object.keys(localOverride.repos).filter(
+        (k) => orchestratorCfg.repos[k],
+      );
+      if (overriddenRepos.length > 0) {
+        console.log(`📦 [local override] extraPackages active for: ${overriddenRepos.join(', ')}`);
+      }
+    }
+  }
+}
 
 const composeServices = (
   parseYaml(readFileSync(path.resolve('./src/docker-compose.services.yml'), 'utf-8')) as {
@@ -256,8 +291,10 @@ export class E2EOrchestrator {
   private streamControllers: AbortController[] = []; // <-- ADD THIS
   private activeStreams: fs.WriteStream[] = []; // <-- ADD THIS
   private _changedRepos = new Set<string>();
+  private _mongooseDebugInjected = new Set<string>(); // worktrees that already got the mongoose-debug preload
   private _deadServices = new Set<string>();
   private _needsRestart = new Set<string>(); // <-- ADD THIS
+  private _mongoHealedDirs = new Set<string>(); // compose stacks whose replica set was already atomically reset this run
   private _partialWarmStart = false; // services healthy but some repos changed
   private worktreeBase = path.resolve(orchestratorCfg.global.worktreeBasePath);
   private npmCacheDir = path.resolve('./.e2e-npm-cache');
@@ -336,27 +373,35 @@ export class E2EOrchestrator {
 
   private readonly STATE_FILE = '.e2e-state.json';
 
-  private getBuildKey(dir: string): { commit: string; dirty: string } | null {
+  private getBuildKey(
+    dir: string,
+    extraPackages?: string[],
+  ): { commit: string; dirty: string } | null {
     try {
       const commit = execSync('git rev-parse HEAD', { cwd: dir }).toString().trim();
 
       // FIX: Added aggressive exclusions for build artifacts, node_modules, and logs.
       // This prevents IDEs or linters from triggering a false-positive "dirty" state
       // if they touch ignored files.
-      const diffCmd =
-        'git diff HEAD -- ":(exclude)*docker-compose*" ":(exclude)*.env*" ":(exclude)node_modules/*" ":(exclude)build/*" ":(exclude)logs/*" ":(exclude).e2e-state.json"';
-
+      // FIX: Aggressive exclusions for build artifacts and package.json to prevent 
+            // extraPackages injections from falsely triggering "source files changed"
+            const diffCmd =
+              'git diff HEAD -- ":(exclude)*docker-compose*" ":(exclude)*.env*" ":(exclude)node_modules/*" ":(exclude)build/*" ":(exclude)logs/*" ":(exclude).e2e-state.json" ":(exclude)package.json" ":(exclude)package-lock.json"';
       const diff = execSync(diffCmd, { cwd: dir }).toString();
 
+      // Include extraPackages in the hash so adding/removing them invalidates the cache.
+      const extraSuffix = extraPackages?.length ? `|extra:${extraPackages.sort().join(',')}` : '';
+      const hashInput = diff + extraSuffix;
+
       let h = 5381;
-      for (let i = 0; i < diff.length; i++) h = ((h << 5) + h) ^ diff.charCodeAt(i);
+      for (let i = 0; i < hashInput.length; i++) h = ((h << 5) + h) ^ hashInput.charCodeAt(i);
       return { commit, dirty: (h >>> 0).toString(16) };
     } catch {
       return null;
     }
   }
 
-  private isBuildCached(dir: string): boolean {
+  private isBuildCached(dir: string, extraPackages?: string[]): boolean {
     if (
       !fs.existsSync(path.join(dir, this.STATE_FILE)) ||
       !fs.existsSync(path.join(dir, 'node_modules')) ||
@@ -365,7 +410,7 @@ export class E2EOrchestrator {
       return false;
     try {
       const saved = JSON.parse(fs.readFileSync(path.join(dir, this.STATE_FILE), 'utf-8'));
-      const current = this.getBuildKey(dir);
+      const current = this.getBuildKey(dir, extraPackages);
       if (!current) return false;
       return saved.commit === current.commit && saved.dirty === current.dirty;
     } catch {
@@ -373,9 +418,9 @@ export class E2EOrchestrator {
     }
   }
 
-  private writeBuildCache(dir: string): void {
+  private writeBuildCache(dir: string, extraPackages?: string[]): void {
     try {
-      const key = this.getBuildKey(dir);
+      const key = this.getBuildKey(dir, extraPackages);
       if (key) fs.writeFileSync(path.join(dir, this.STATE_FILE), JSON.stringify(key));
     } catch {
       /* non-fatal */
@@ -500,7 +545,6 @@ export class E2EOrchestrator {
 
   private runAsync(cmd: string, cwd: string, env: any = process.env): Promise<void> {
     return new Promise((resolve, reject) => {
-      // ---> FIX: Inject aggressive SSH timeout to prevent 2.5 minute hangs <---
       const mergedEnv = { ...env, GIT_SSH_COMMAND: 'ssh -o ConnectTimeout=5 -o BatchMode=yes' };
       const proc = Bun.spawn(cmd.split(' '), {
         cwd,
@@ -510,18 +554,18 @@ export class E2EOrchestrator {
       });
 
       proc.exited.then(async () => {
+        // ALWAYS consume both streams immediately
+        const out = await new Response(proc.stdout).text();
+        const err = await new Response(proc.stderr).text();
+
         if (proc.exitCode === 0) resolve();
-        else {
-          const err = await new Response(proc.stderr).text();
-          reject(new Error(`Command failed: ${cmd}\n${err}`));
-        }
+        else reject(new Error(`Command failed: ${cmd}\n${err}`));
       });
     });
   }
 
   private runAsyncOutput(cmd: string, cwd: string, timeoutMs = 10000): Promise<string> {
     return new Promise((resolve, reject) => {
-      // ---> FIX: SSH Timeout + JavaScript fallback timeout for ls-remote <---
       const mergedEnv = {
         ...process.env,
         GIT_SSH_COMMAND: 'ssh -o ConnectTimeout=5 -o BatchMode=yes',
@@ -533,7 +577,6 @@ export class E2EOrchestrator {
         stderr: 'pipe',
       });
 
-      // Fallback: If git hangs on an HTTP fetch instead of SSH, kill it after 10s
       const timer = setTimeout(() => {
         proc.kill(9);
         reject(new Error(`Command timed out after ${timeoutMs}ms: ${cmd}`));
@@ -541,9 +584,12 @@ export class E2EOrchestrator {
 
       proc.exited.then(async () => {
         clearTimeout(timer);
+        // ALWAYS consume both streams
         const out = await new Response(proc.stdout).text();
+        const err = await new Response(proc.stderr).text();
+
         if (proc.exitCode === 0) resolve(out.trim());
-        else reject(new Error(`Command failed: ${cmd}`));
+        else reject(new Error(`Command failed: ${cmd}\n${err}`));
       });
     });
   }
@@ -685,6 +731,28 @@ export class E2EOrchestrator {
         ? `mongodb://${mUser}:${mPass}@${mHost}:${mPort}/${mongoName}?authSource=admin`
         : `mongodb://${mHost}:${mPort}/${mongoName}`;
 
+    // ── Mongoose query debug logging (only apps that bundle mongoose) ──────────
+    // No source edits: a --require preload flips .set('debug', true) on the app's OWN
+    // mongoose singleton. require() of the same resolved path returns the same instance
+    // the app uses, so the flag actually applies. Apps without mongoose are untouched.
+    try {
+      const mongoosePath = path.join(worktreeDir, 'node_modules', 'mongoose');
+      if (fs.existsSync(mongoosePath)) {
+        const preload = path.join(worktreeDir, '.e2e-mongoose-debug.cjs');
+        if (!this._mongooseDebugInjected.has(worktreeDir)) {
+          fs.writeFileSync(
+            preload,
+            "try{var p=process.env.__E2E_MONGOOSE_PATH__;if(p)require(p).set('debug',true);}catch(e){}\n",
+          );
+          this._mongooseDebugInjected.add(worktreeDir);
+        }
+        merged.__E2E_MONGOOSE_PATH__ = mongoosePath;
+        merged.NODE_OPTIONS = `${merged.NODE_OPTIONS ? `${merged.NODE_OPTIONS} ` : ''}--require ${preload}`;
+      }
+    } catch {
+      /* non-fatal — debug logging is best-effort */
+    }
+
     return merged;
   }
 
@@ -696,6 +764,38 @@ export class E2EOrchestrator {
         fs.mkdirSync(this.worktreeBase, { recursive: true });
       }
       console.log('🌳 Provisioning Git Worktrees (Concurrently)...');
+
+      // ---> START OF FIX: Deduplicated & Auto-Healing Fetcher <---
+      const uniqueFetchPromises = new Map<string, Promise<void>>();
+      const safeFetch = (repoPath: string, executeDir: string) => {
+        const key = path.resolve(repoPath);
+        if (!uniqueFetchPromises.has(key)) {
+          uniqueFetchPromises.set(
+            key,
+            (async () => {
+              try {
+                // --force safely overwrites diverged remote branches, deduplication prevents lock contention
+                await this.runAsync('git fetch --all --tags --prune --force', executeDir);
+              } catch (e: any) {
+                const msg = String(e.message || '');
+                if (msg.includes('lock') || msg.includes('unable to update local ref')) {
+                  console.log(
+                    `   -> ⚠️  Git lock conflict in ${path.basename(repoPath)}. Auto-healing refs...`,
+                  );
+                  // Nuke broken refs/locks and retry safely
+                  await this.runAsync('git pack-refs --all --prune', executeDir).catch(() => {});
+                  await this.runAsync('git gc --prune=now', executeDir).catch(() => {});
+                  await this.runAsync('git fetch --all --tags --prune --force', executeDir);
+                } else {
+                  throw e;
+                }
+              }
+            })(),
+          );
+        }
+        return uniqueFetchPromises.get(key)!; // Returns the shared promise
+      };
+      // ---> END OF FIX <---
 
       // ── Optimistic provisioning ───────────────────────────────────────────────
       // Strategy:
@@ -752,58 +852,35 @@ export class E2EOrchestrator {
               }
               // Local mismatch → fetch now.
               console.log(`   -> Updating ${repoName} @ ${repo.target}...`);
-              await this.runAsync('git fetch --all --tags', targetDir);
+              await safeFetch(repoPath, targetDir);
               try {
                 await this.runAsync(`git checkout --detach origin/${repo.target}`, targetDir);
               } catch {
                 await this.runAsync(`git checkout --detach ${repo.target}`, targetDir);
               }
             } else {
-              // ── Intuitiveness & Customizability: Local vs Remote explicit tracking ──
+              // ── Intuitiveness & Customizability: Strict Local vs Remote tracking ──
               const isExplicitRemote = repo.target.startsWith('origin/');
               const branchName = isExplicitRemote ? repo.target.substring(7) : repo.target;
 
-              const currentBranch = await this.runAsyncOutput(
-                'git rev-parse --abbrev-ref HEAD',
-                targetDir,
-              ).catch(() => '');
-              const headMatchesTarget = isExplicitRemote
-                ? currentBranch === 'HEAD' // Explicit remote should be a detached HEAD
-                : currentBranch === branchName; // Local target should be on the actual branch
+              // Check if we have a local SHA first
+              let expectedSha: string | null = null;
+              if (!isExplicitRemote) {
+                expectedSha = await this.runAsyncOutput(
+                  `git rev-parse ${branchName}`,
+                  repoPath,
+                ).catch(() => null);
+              }
+
+              const headMatchesTarget = !!expectedSha && headSha === expectedSha;
 
               const lsKey = `${repoName}::${branchName}`;
               if (!pendingBranchChecks.has(lsKey)) {
                 pendingBranchChecks.set(
                   lsKey,
-                  this.runAsyncOutput(`git ls-remote origin refs/heads/${branchName}`, repoPath)
-                    .then(async (out) => {
-                      const remoteSha = out.split('\n')[0]?.split('\t')[0]?.trim() || null;
-                      let needsFetch = false;
-
-                      if (isExplicitRemote) {
-                        // Strict remote: if our HEAD isn't the remote SHA, fetch and detach
-                        needsFetch = !headMatchesTarget || (!!remoteSha && headSha !== remoteSha);
-                      } else {
-                        // Local first: we only need to fetch/update if we are NOT on the branch,
-                        // OR if the remote is strictly ahead of our local branch.
-                        if (!headMatchesTarget) {
-                          needsFetch = true;
-                        } else if (remoteSha && headSha !== remoteSha) {
-                          // Check if remote is ahead (can we fast-forward?)
-                          const mergeBase = await this.runAsyncOutput(
-                            `git merge-base HEAD ${remoteSha}`,
-                            targetDir,
-                          ).catch(() => null);
-                          if (mergeBase === headSha) {
-                            // Local is behind remote -> we must fetch to fast-forward
-                            needsFetch = true;
-                          } else {
-                            // Local is ahead (unpushed WIP) or diverged. Trust local!
-                            needsFetch = false;
-                          }
-                        }
-                      }
-
+                  (async () => {
+                    // ---> THE SPEED FIX: Skip network entirely if we have a local branch <---
+                    if (!isExplicitRemote && expectedSha) {
                       return {
                         repoName,
                         repoPath,
@@ -811,20 +888,39 @@ export class E2EOrchestrator {
                         target: repo.target,
                         branchName,
                         isExplicitRemote,
-                        needsFetch,
-                        hasRemote: !!remoteSha, // <-- ADD THIS
+                        needsFetch: !headMatchesTarget,
+                        hasRemote: false, // Skip all remote sync logic completely
                       };
-                    })
-                    .catch(() => ({
+                    }
+
+                    // Otherwise, hit the network to resolve it
+                    const out = await this.runAsyncOutput(
+                      `git ls-remote origin refs/heads/${branchName}`,
+                      repoPath,
+                    ).catch(() => '');
+                    const remoteSha = out.split('\n')[0]?.split('\t')[0]?.trim() || null;
+                    let needsFetch = false;
+
+                    if (isExplicitRemote) {
+                      needsFetch = !headMatchesTarget || (!!remoteSha && headSha !== remoteSha);
+                    } else {
+                      // Fallback: we wanted local but it didn't exist yet, rely on remote
+                      if (!headMatchesTarget || (remoteSha && headSha !== remoteSha)) {
+                        needsFetch = true;
+                      }
+                    }
+
+                    return {
                       repoName,
                       repoPath,
                       targetDir,
                       target: repo.target,
                       branchName,
                       isExplicitRemote,
-                      needsFetch: !headMatchesTarget,
-                      hasRemote: false, // <-- ADD THIS
-                    })),
+                      needsFetch,
+                      hasRemote: !!remoteSha,
+                    };
+                  })(),
                 );
               }
 
@@ -839,7 +935,7 @@ export class E2EOrchestrator {
           } else {
             console.log(`   -> Checking out ${repoName} @ ${repo.target}...`);
             if (fs.existsSync(targetDir)) fs.rmSync(targetDir, { recursive: true, force: true });
-            await this.runAsync('git fetch --all --tags', repoPath);
+            await safeFetch(repoPath, repoPath);
             try {
               await this.runAsync('git worktree prune', repoPath);
             } catch {}
@@ -848,30 +944,25 @@ export class E2EOrchestrator {
             const isExplicitRemote = repo.target.startsWith('origin/');
             const branchName = isExplicitRemote ? repo.target.substring(7) : repo.target;
 
-            if (isExplicitRemote) {
-              await this.runAsync(
-                `git worktree add --detach ${targetDir} origin/${branchName}`,
-                repoPath,
-              );
-            } else {
-              await this.runAsync(`git worktree add ${targetDir} ${branchName}`, repoPath).catch(
-                async () => {
-                  // Try detaching in case it's checked out in another worktree
-                  await this.runAsync(
-                    `git worktree add --detach ${targetDir} ${branchName}`,
-                    repoPath,
-                  ).catch(async (err2) => {
-                    // Fallback: create local branch tracking remote if it truly doesn't exist
-                    await this.runAsync(
-                      `git worktree add -b ${branchName} ${targetDir} origin/${branchName}`,
-                      repoPath,
-                    ).catch(() => {
-                      throw err2; // Throw original error so we see why it failed
-                    });
-                  });
-                },
-              );
-            }
+            // FIX: Always detach worktrees to prevent locking the branch in your main repo.
+            // Use the resolved SHA to avoid ambiguity inside a worktree directory.
+            const worktreeRef = isExplicitRemote ? `origin/${branchName}` : branchName;
+            await this.runAsync(
+              `git worktree add --detach ${targetDir} ${worktreeRef}`,
+              repoPath,
+            ).catch(async (err) => {
+              if (!isExplicitRemote) {
+                // Fallback: If local branch truly doesn't exist yet, detach from remote
+                await this.runAsync(
+                  `git worktree add --detach ${targetDir} origin/${branchName}`,
+                  repoPath,
+                ).catch(() => {
+                  throw err;
+                });
+              } else {
+                throw err;
+              }
+            });
           }
         }),
       );
@@ -884,45 +975,61 @@ export class E2EOrchestrator {
         if (stale.length > 0) {
           await Promise.all(
             stale.map(
-              async ({ repoName, targetDir, target, branchName, isExplicitRemote, hasRemote }) => {
+              async ({
+                repoName,
+                targetDir,
+                target,
+                branchName,
+                isExplicitRemote,
+                hasRemote,
+                repoPath,
+              }) => {
                 console.log(`   -> ${repoName} @ ${target}: syncing with remote...`);
-                await this.runAsync('git fetch --all --tags', targetDir);
+                await safeFetch(repoPath, targetDir);
                 try {
-                  if (isExplicitRemote) {
-                    await this.runAsync(`git checkout --detach origin/${branchName}`, targetDir);
-                  } else {
-                    // Try to checkout the local branch
-                    await this.runAsync(`git checkout ${branchName}`, targetDir).catch(async () => {
-                      // If it failed, try detaching (handles locked branch in another worktree)
-                      await this.runAsync(`git checkout --detach ${branchName}`, targetDir).catch(
-                        async (err2: any) => {
-                          if (hasRemote) {
-                            await this.runAsync(
-                              `git checkout -b ${branchName} origin/${branchName}`,
-                              targetDir,
-                            );
-                          } else {
-                            throw err2;
-                          }
-                        },
-                      );
-                    });
+                  // ALWAYS resolve any ref to a raw SHA before calling `git checkout --detach`.
+                  // Inside a worktree, `--detach <branch-name>` or `--detach origin/<branch>`
+                  // fails with "does not take a path argument" because git treats the name as
+                  // a path relative to the worktree directory. Only raw SHAs are unambiguous.
+                  //
+                  // KEY: resolve refs against repoPath (the main repo), NOT targetDir (the worktree).
+                  // Remote tracking refs (origin/LGRGS-487) only live in the main .git directory.
+                  // Worktrees have a .git FILE (pointer), not a full .git directory with remotes.
+                  const resolveRef = async (ref: string): Promise<string | null> =>
+                    this.runAsyncOutput(`git rev-parse ${ref}`, repoPath).catch(() => null);
 
-                    if (hasRemote) {
-                      // Attempt safe fast-forward
-                      await this.runAsync(
-                        `git pull --ff-only origin ${branchName}`,
-                        targetDir,
-                      ).catch(() => {
-                        console.log(
-                          `   -> ⚠️  ${repoName}: Local branch '${branchName}' has unpushed commits or diverged. Keeping local state.`,
-                        );
-                      });
-                    } else {
+                  // Resolution order for local branches:
+                  //   1. <branch>         — local branch (highest priority)
+                  //   2. origin/<branch>  — freshly fetched fallback
+                  let targetSha: string | null;
+                  if (isExplicitRemote) {
+                    targetSha = await resolveRef(`origin/${branchName}`);
+                  } else {
+                    targetSha =
+                      (await resolveRef(branchName)) ?? (await resolveRef(`origin/${branchName}`));
+                  }
+
+                  if (!targetSha) {
+                    throw new Error(
+                      `Cannot resolve ref '${branchName}' to a SHA. Make sure the branch exists locally or on origin.`,
+                    );
+                  }
+
+                  await this.runAsync(`git checkout --detach ${targetSha}`, targetDir);
+
+                  if (!isExplicitRemote && hasRemote) {
+                    // Fast-forward check: if local is behind remote after detach, log it
+                    // (we already detached to origin/ SHA above, so nothing extra to do)
+                    const localSha = await resolveRef(branchName);
+                    if (localSha && localSha !== targetSha) {
                       console.log(
-                        `   -> ℹ️  ${repoName}: Local branch '${branchName}' is unpushed. Using local state.`,
+                        `   -> ℹ️  ${repoName}: Detached to remote tip (local branch '${branchName}' is behind or diverged).`,
                       );
                     }
+                  } else if (!isExplicitRemote && !hasRemote) {
+                    console.log(
+                      `   -> ℹ️  ${repoName}: Local branch '${branchName}' is unpushed. Using local state.`,
+                    );
                   }
                 } catch (e: any) {
                   // Extract the real Git error message so it's not hidden
@@ -1069,6 +1176,73 @@ export class E2EOrchestrator {
     }
   }
 
+  /** Shell-exec helper for complex commands (pipes/quotes) without splitting on spaces. */
+  private shAsync(cmd: string, cwd?: string): Promise<string> {
+    return new Promise((resolve, reject) => {
+      const proc = Bun.spawn(['sh', '-c', cmd], { cwd, stdout: 'pipe', stderr: 'ignore' });
+      proc.exited.then(async () => {
+        // MUST consume stdout even if we intend to reject an error below
+        const out = await new Response(proc.stdout).text();
+
+        if (proc.exitCode === 0) resolve(out.trim());
+        else reject(new Error('Command failed'));
+      });
+    });
+  }
+
+  /**
+   * Returns true if any infra worktree's MongoDB replica set is unhealthy:
+   * no writable PRIMARY, no joined SECONDARY, or a member-ID collision
+   * ("Received heartbeat from member with the same member ID as ourself").
+   * Used on warm start to catch the stale/flapping set that produces
+   * "primary marked stale due to discovery of newer primary" 500s.
+   */
+  private async anyMongoReplicaUnhealthy(): Promise<boolean> {
+    const verifyEval = `var s=rs.status();var prim=s.members.some(function(m){return m.state===1});var sec=s.members.some(function(m){return m.state===2});var collide=s.members.some(function(m){return /same member ID/.test(String(m.lastHeartbeatMessage))});if(!prim||!sec||collide)quit(1);`;
+    const seen = new Set<string>();
+    for (const [repoName, repo] of Object.entries(orchestratorCfg.repos)) {
+      const repoPath = path.resolve(repo.repoPath);
+      if (seen.has(repoPath)) continue;
+      seen.add(repoPath);
+
+      const dir = path.join(this.worktreeBase, repoName);
+      const composeFile = path.join(dir, 'docker-compose.yml');
+      if (!fs.existsSync(composeFile)) continue;
+
+      let doc: any;
+      try {
+        doc = parseYaml(fs.readFileSync(composeFile, 'utf-8'));
+      } catch {
+        continue;
+      }
+      const mongoSvcs = Object.entries<any>(doc?.services ?? {})
+        .map(([n]) => n)
+        .filter(
+          (n) =>
+            (n.toLowerCase().includes('mongo') ||
+              String(doc.services[n].image || '')
+                .toLowerCase()
+                .includes('mongo')) &&
+            !n.toLowerCase().includes('init'),
+        );
+      // Prefer the PRIMARY: rs.status() works from any member, and the primary always
+      // listens on the default port (27017), so the exec below needs no --port juggling.
+      const mongoSvc = mongoSvcs.find((n) => n.toLowerCase().includes('primary')) ?? mongoSvcs[0];
+      if (!mongoSvc) continue;
+
+      try {
+        const cid = await this.shAsync(`docker compose ps -q ${mongoSvc} | head -1`, dir);
+        if (!cid) return true; // container missing on a "warm" start → definitely not healthy
+        await this.shAsync(
+          `docker exec -w / ${cid} sh -c 'mongosh -u root -p root --authenticationDatabase admin --quiet --eval "${verifyEval}"' 2>/dev/null || docker exec -w / ${cid} sh -c 'mongo -u root -p root --authenticationDatabase admin --quiet --eval "${verifyEval}"'`,
+        );
+      } catch {
+        return true; // verify eval quit(1) or exec failed → replica set unhealthy
+      }
+    }
+    return false;
+  }
+
   async startInfrastructure() {
     // On warm start, Docker must already be running (services are healthy).
     // Skip the `docker info` probe (~300ms) — it adds overhead for no benefit.
@@ -1078,9 +1252,28 @@ export class E2EOrchestrator {
     this.startObservability();
 
     if (this._warmStart) {
-      console.log('⚡ Warm start: skipping Docker infrastructure startup.');
-      this._startDockerLogCapture(); // still capture container logs even on warm start
-      return;
+      // Warm start skips infra — but a stale/flapping replica set is the #1 cause of
+      // "primary marked stale due to discovery of newer primary" 500s, and the app's
+      // /health can pass while a specific endpoint still hits the stale primary. So we
+      // ALWAYS validate the replica set here. If it's unhealthy, demote to a cold start
+      // (rather than wiping mid-warm, which would destroy app data without re-migrating):
+      // the cold path handles wipe + re-init + re-migrate + service restart correctly.
+      const mongoBad = await this.anyMongoReplicaUnhealthy();
+      if (!mongoBad) {
+        console.log('⚡ Warm start: skipping Docker infrastructure startup.');
+        this._startDockerLogCapture(); // still capture container logs even on warm start
+        return;
+      }
+      console.log(
+        '   ⚠️  Warm start aborted: MongoDB replica set is stale/flapping. Falling back to cold start (wipe + re-init + re-migrate).',
+      );
+      this._warmStart = false;
+      this._partialWarmStart = false;
+      try {
+        fs.rmSync(this.readyFile, { force: true });
+      } catch {}
+      // Force volume invalidation + migration for every repo on the cold pass.
+      for (const repoName of Object.keys(orchestratorCfg.repos)) this._changedRepos.add(repoName);
     }
 
     console.log('🐳 Starting Infrastructure (Docker Compose)...');
@@ -1111,6 +1304,30 @@ export class E2EOrchestrator {
         const composeFile = path.join(dir, 'docker-compose.yml');
         if (!fs.existsSync(composeFile)) return;
 
+        // ---> AUTOMATED VOLUME INVALIDATION LAYER <---
+        if (this._changedRepos.has(repoName)) {
+          console.log(
+            `   -> 🧹 Branch/Target change detected for ${repoName}. Auto-clearing stale volumes...`,
+          );
+          try {
+            await this.runAsync('docker compose down -v --remove-orphans', dir).catch(() => {});
+
+            // ONLY wipe the data folders. Do NOT delete tracked files like init-replica-set.sh!
+            const wipeDirs = [
+              'mongo/primary/data',
+              'mongo/secondary/data',
+              'postgreSql/data',
+              'redis/data',
+              'rustfs/data',
+            ];
+            for (const d of wipeDirs) {
+              fs.rmSync(path.join(dir, `.docker-rgs/${d}`), { recursive: true, force: true });
+            }
+          } catch (e) {
+            /* non-fatal fallback */
+          }
+        }
+
         console.log(`   -> Bringing up ${repoName} infra...`);
 
         // Patch macOS AirPlay port conflicts
@@ -1120,7 +1337,42 @@ export class E2EOrchestrator {
           .replace(/"7000:9000"/g, '"7002:9000"')
           .replace(/'7001:9001'/g, "'7003:9001'")
           .replace(/"7001:9001"/g, '"7003:9001"');
+
+        // ── MongoDB host-access fix (2-node replica) ──────────────────────────
+        // The app runs on the HOST and connects to 127.0.0.1:27017. The mongo driver
+        // then auto-discovers the replica set and monitors the advertised member hosts.
+        // With the secondary published as 27018:27017, its advertised address
+        // (mongo-secondary → 127.0.0.1, port 27017 via /etc/hosts) collapses onto the
+        // PRIMARY, so the driver sees one primary under two addresses → "primary marked
+        // stale due to discovery of newer primary" 500s. Fix: make the secondary LISTEN
+        // on 27018 and publish 27018:27018, so its advertised address (mongo-secondary:27018)
+        // is identical and reachable both inside the docker network and from the host.
+        // Production is unaffected — it runs in-cluster and never touches this local compose.
+        content = content
+          .replace(/'27018:27017'/g, "'27018:27018'")
+          .replace(/"27018:27017"/g, '"27018:27018"');
+        {
+          // Append `--port 27018` to the SECONDARY's mongod command only (primary stays
+          // 27017). Both commands are identical; the secondary is the 2nd occurrence.
+          let mongodSeen = 0;
+          content = content.replace(/mongod --replSet rs --bind_ip_all(?! --port)/g, (mt) =>
+            ++mongodSeen === 2 ? `${mt} --port 27018` : mt,
+          );
+        }
         fs.writeFileSync(composeFile, content);
+
+        // Align the replica-set init script with the secondary's new port (27018) so
+        // rs.initiate advertises mongo-secondary:27018 and the readiness ping targets it.
+        try {
+          const initScript = path.join(dir, '.docker-rgs/mongo/init-replica-set.sh');
+          if (fs.existsSync(initScript)) {
+            const orig = fs.readFileSync(initScript, 'utf-8');
+            const patched = orig.replace(/mongo-secondary:27017/g, 'mongo-secondary:27018');
+            if (patched !== orig) fs.writeFileSync(initScript, patched);
+          }
+        } catch {
+          /* non-fatal */
+        }
 
         if (this.network) {
           const overrides = orchestratorCfg.composeServiceEnvOverrides?.[repoName] ?? {};
@@ -1205,12 +1457,11 @@ export class E2EOrchestrator {
       return new Promise((resolve, reject) => {
         const proc = Bun.spawn(['sh', '-c', cmd], { cwd, stdout: 'pipe', stderr: 'ignore' });
         proc.exited.then(async () => {
-          if (proc.exitCode === 0) {
-            const out = await new Response(proc.stdout).text();
-            resolve(out.trim());
-          } else {
-            reject(new Error('Command failed'));
-          }
+          // ALWAYS consume stream on success AND failure
+          const out = await new Response(proc.stdout).text();
+
+          if (proc.exitCode === 0) resolve(out.trim());
+          else reject(new Error('Command failed'));
         });
       });
     };
@@ -1238,8 +1489,19 @@ export class E2EOrchestrator {
                 await execAsync(`docker exec -w / ${containerId} pg_isready -U postgres`);
               }
               if (isMongo) {
+                // STRICT MONGODB HEALTHCHECK (per node):
+                // Healthy = node holds a stable replica role. A PRIMARY has ismaster=true;
+                // a healthy SECONDARY has ismaster=false but secondary=true. The old check
+                // (`setName && !ismaster → fail`) wrongly flagged EVERY secondary as broken,
+                // which triggered single-node wipes — the exact cause of the member-ID
+                // collision ("same member ID as ourself") and the stale-primary cascade.
+                // We also fail fast if rs.status reports that collision on any member, so a
+                // genuinely corrupt set triggers the atomic full-reset path below.
+                const evalCmd = `var m=db.isMaster();if(m.setName&&!(m.ismaster||m.secondary))quit(1);if(m.hosts){try{var s=rs.status();if(s.members.some(function(x){return /same member ID/.test(String(x.lastHeartbeatMessage))}))quit(1);}catch(e){}}`;
+                // --port ${port}: inside the container mongod listens on its internal port,
+                // which now equals the published host port (primary 27017, secondary 27018).
                 await execAsync(
-                  `docker exec -w / ${containerId} sh -c 'mongosh -u root -p root --authenticationDatabase admin --quiet --eval "db.adminCommand(\\"ping\\")"'`,
+                  `docker exec -w / ${containerId} sh -c 'mongosh -u root -p root --authenticationDatabase admin --port ${port} --quiet --eval "${evalCmd}"' 2>/dev/null || docker exec -w / ${containerId} sh -c 'mongo -u root -p root --authenticationDatabase admin --port ${port} --quiet --eval "${evalCmd}"'`,
                 );
               }
               if (isKafka) {
@@ -1252,15 +1514,89 @@ export class E2EOrchestrator {
             ready = true;
             break;
           } catch {
-            await new Promise((r) => setTimeout(r, 1000));
+            await new Promise((r) => setTimeout(r, 500));
           }
         }
 
-        if (ready) console.log(`   ✅ Port ${port} (${serviceName}) is fully ready.`);
-        else
-          console.warn(
-            `   ⚠️  Port ${port} (${serviceName}) still warming up, proceeding with caution...`,
-          );
+        if (ready) {
+          console.log(`   ✅ Port ${port} (${serviceName}) is fully ready.`);
+        } else {
+          console.log(`   ⚠️  Port ${port} (${serviceName}) is STUCK or CORRUPTED.`);
+
+          try {
+            if (isMongo) {
+              // Mongo replica members share ONE identity space. Healing a single node leaves
+              // the set with mismatched member IDs ("Received heartbeat from member with the
+              // same member ID as ourself") and endless re-elections — which the app driver
+              // surfaces as "primary marked stale due to discovery of newer primary".
+              // Bind-mounted data also survives `down -v`, so stale config persists across runs.
+              // Reset the whole set as one atomic unit, exactly once per compose stack.
+              if (this._mongoHealedDirs.has(dir)) {
+                await new Promise((r) => setTimeout(r, 8000)); // another probe already triggered the reset
+              } else {
+                this._mongoHealedDirs.add(dir);
+                console.log(
+                  `   ♻️  Auto-healing: wiping BOTH mongo nodes + re-initializing replica set (atomic)...`,
+                );
+                // -s stops, -v drops named volumes; physical rm clears the bind mounts.
+                await execAsync(
+                  `docker compose rm -f -s -v mongo-primary mongo-secondary mongo-init`,
+                  dir,
+                ).catch(() => {});
+                for (const nodeType of ['primary', 'secondary']) {
+                  try {
+                    fs.rmSync(path.join(dir, `.docker-rgs/mongo/${nodeType}/data`), {
+                      recursive: true,
+                      force: true,
+                    });
+                  } catch {}
+                }
+                await execAsync(`docker compose up -d mongo-primary mongo-secondary`, dir);
+                await execAsync(`docker compose up -d mongo-init`, dir).catch(() => {});
+              }
+
+              // Verify the set actually re-formed: writable PRIMARY + joined SECONDARY + no
+              // member-ID collision. nc-on-port is not enough — a flapping set keeps the port
+              // open while never reaching a stable topology.
+              const verifyEval = `var s=rs.status();var prim=s.members.some(function(m){return m.state===1});var sec=s.members.some(function(m){return m.state===2});var collide=s.members.some(function(m){return /same member ID/.test(String(m.lastHeartbeatMessage))});if(!prim||!sec||collide)quit(1);`;
+              let healed = false;
+              for (let j = 0; j < 30; j++) {
+                try {
+                  const cid = await execAsync(`docker compose ps -q ${serviceName} | head -1`, dir);
+                  if (cid) {
+                    await execAsync(
+                      `docker exec -w / ${cid} sh -c 'mongosh -u root -p root --authenticationDatabase admin --port ${port} --quiet --eval "${verifyEval}"' 2>/dev/null || docker exec -w / ${cid} sh -c 'mongo -u root -p root --authenticationDatabase admin --port ${port} --quiet --eval "${verifyEval}"'`,
+                    );
+                    healed = true;
+                    break;
+                  }
+                } catch {}
+                await new Promise((r) => setTimeout(r, 1000));
+              }
+              if (!healed) {
+                throw new Error(
+                  `MongoDB replica set in ${path.basename(dir)} failed to re-form (no stable primary + secondary).`,
+                );
+              }
+              console.log(
+                `   ✅ Auto-healing successful: replica set re-formed (primary + secondary).`,
+              );
+            } else {
+              console.log(`   ♻️  Auto-healing: Restarting ${serviceName}...`);
+              await execAsync(`docker compose restart ${serviceName}`, dir);
+              console.log(`   ⏳ Waiting 8s for ${serviceName} to stabilize...`);
+              await new Promise((r) => setTimeout(r, 8000));
+              // Final verification check
+              await execAsync(`nc -z -w 1 127.0.0.1 ${port}`);
+              console.log(`   ✅ Auto-healing successful for ${serviceName}.`);
+            }
+          } catch (e) {
+            console.error(`   ❌ Auto-healing failed for ${serviceName}.`);
+            throw new Error(
+              `CRITICAL: Infrastructure service '${serviceName}' on port ${port} is permanently dead. Halting boot to prevent API errors.`,
+            );
+          }
+        }
       }),
     );
 
@@ -1359,9 +1695,7 @@ export class E2EOrchestrator {
 
         // REDO Logic - Triggered explicitly by YAML flushData or alwaysRedoMigration
         // (Removed automatic wipe on repo change to drastically speed up incremental migrations)
-        const targetNeedsRedo =
-          repoCfg?.alwaysRedoMigration ||
-          targetsToRedo.has(target.name);
+        const targetNeedsRedo = repoCfg?.alwaysRedoMigration || targetsToRedo.has(target.name);
 
         if (targetNeedsRedo) {
           console.log(`   -> [REDO] Wiping ${target.name}...`);
@@ -1438,11 +1772,13 @@ export class E2EOrchestrator {
 
         buildTasks.push(
           (async () => {
-            if (this.isBuildCached(worktreeDir)) {
+            const repoCfg = orchestratorCfg.repos[repo];
+            const extraPackages = repoCfg?.extraPackages ?? [];
+
+            if (this.isBuildCached(worktreeDir, extraPackages)) {
               console.log(`   [CACHE HIT] ${repo}: skipping install & build`);
               return;
             }
-            const repoCfg = orchestratorCfg.repos[repo];
             const mergedEnv = this.buildEnvironment(worktreeDir, svc, repo, repoCfg);
 
             // ---> BOTTLENECK OPTIMIZATION: SHARED NPM CACHE <---
@@ -1466,13 +1802,46 @@ export class E2EOrchestrator {
               });
 
               await proc.exited;
+
+              // 1. Consume standard install streams
+              const out = await new Response(proc.stdout).text();
+              const err = await new Response(proc.stderr).text();
+
               if (proc.exitCode !== 0) {
-                const err = await new Response(proc.stderr).text();
-                const out = await new Response(proc.stdout).text();
                 throw new Error(`Build failed for ${repo}:\nSTDOUT: ${out}\nSTDERR: ${err}`);
               }
+
+              if (
+                (cmd.trim() === 'npm install' || cmd.trim() === 'npm i') &&
+                extraPackages.length > 0
+              ) {
+                console.log(
+                  `   [LOCAL OVERRIDE] ${repo}: injecting extra packages: ${extraPackages.join(', ')}`,
+                );
+                const extraInstall = Bun.spawn(
+                  ['sh', '-c', `exec npm install ${extraPackages.join(' ')}`],
+                  {
+                    cwd: worktreeDir,
+                    env: mergedEnv as any,
+                    stdout: 'pipe',
+                    stderr: 'pipe',
+                  },
+                );
+                await extraInstall.exited;
+
+                // 2. Consume extraPackages streams
+                const extOut = await new Response(extraInstall.stdout).text();
+                const extErr = await new Response(extraInstall.stderr).text();
+
+                if (extraInstall.exitCode !== 0) {
+                  throw new Error(
+                    `[local override] Extra package install failed for ${repo}:\n${extErr}\n\nHint: ensure your global ~/.npmrc has the correct registry and auth token for scoped packages.`,
+                  );
+                }
+                console.log(`   [LOCAL OVERRIDE] ${repo}: extra packages installed ✅`);
+              }
             }
-            this.writeBuildCache(worktreeDir);
+            this.writeBuildCache(worktreeDir, extraPackages);
           })(),
         );
       }
@@ -1685,8 +2054,10 @@ export class E2EOrchestrator {
       }
 
       // 3. Verify Remote Branches (If a teammate pushed code, this fails)
+      // ONLY check explicit remotes on the network. If a user specified a local branch,
+      // they don't want us invalidating their run just because a teammate pushed to GitHub.
       const branches = Object.entries(orchestratorCfg.repos)
-        .filter(([, repo]) => !/^v?\d+\.\d+/.test(repo.target))
+        .filter(([, repo]) => !/^v?\d+\.\d+/.test(repo.target) && repo.target.startsWith('origin/'))
         .map(([repoKey, repo]) => {
           const isExplicitRemote = repo.target.startsWith('origin/');
           return {
@@ -1745,15 +2116,43 @@ export class E2EOrchestrator {
         }
       }
     } catch (e) {
-      // ---> THE FIX <---
-      // Delete the ready state so the next run knows to execute a Cold Start
-      this._deleteReadyState();
+      // ---> AUTOMATED SELF-HEALING ENHANCEMENT <---
+      logBg(
+        '\n🚨 [bg-validation] Environment corruption detected (Service crash or MongoDB stale primary).',
+      );
+      logBg('⚙️  Initiating automated self-healing routine...');
 
-      // Because this promise floats in the background, throwing here causes an
-      // Unhandled Promise Rejection which kills the test suite BEFORE `afterAll` runs.
-      // We MUST write the marker file right here so the Bash wrapper knows to restart.
+      try {
+        // 1. Programmatically trigger a soft reset to purge confused database connections
+        //    and drop dangling lock files/ghost panes without nuking git worktrees
+        const worktreeBaseDir = this.worktreeBase;
+        const portsToClearStr = this.portsToClear.join(' ');
+
+        // Execute clean background port purging natively to kick stale database nodes
+        if (portsToClearStr) {
+          execSync(
+            `lsof -P -n -i:${portsToClearStr.replace(/ /g, ',')} -sTCP:LISTEN | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`,
+          );
+        }
+
+        // Wipe ready status markers so the recovery run initializes clean caches
+        this._deleteReadyState();
+        try {
+          fs.unlinkSync(path.resolve('logs/.rerun-needed'));
+        } catch {}
+        try {
+          execSync(`rm -f /tmp/e2e_logs_kill_*.lock`);
+        } catch {}
+
+        logBg('✅ Self-healing cleanup complete. Queueing automatic test rerun...');
+      } catch (cleanupErr: any) {
+        logBg(`⚠️  Self-healing recovery encountered an error: ${cleanupErr.message}`);
+      }
+
+      // 2. Drop the rerun marker file that src/scripts/run-tests.sh listens for
       fs.writeFileSync(path.resolve('logs/.rerun-needed'), '');
 
+      // Throwing here halts the current corrupted test run instantly so the shell wrapper can take over
       throw e;
     }
   }
@@ -2057,6 +2456,7 @@ export class E2EOrchestrator {
       const composedDown = new Set<string>();
 
       // DARK MAGIC: Run all Docker composes down in parallel instead of sequentially
+      // Run all Docker composes down in parallel instead of sequentially
       const teardownPromises = Object.entries(orchestratorCfg.repos).map(([repoName, repo]) => {
         const dir = path.join(this.worktreeBase, repoName);
         const repoPath = path.resolve(repo.repoPath);
@@ -2069,7 +2469,21 @@ export class E2EOrchestrator {
             return Bun.spawn(
               ['docker', 'compose', 'down', '--timeout', '10', '-v', '--remove-orphans'],
               { cwd: dir, stdout: 'ignore', stderr: 'ignore' },
-            ).exited;
+            ).exited.then(() => {
+              // ---> CLEANUP ON TEARDOWN <---
+              const wipeDirs = [
+                'mongo/primary/data',
+                'mongo/secondary/data',
+                'postgreSql/data',
+                'redis/data',
+                'rustfs/data',
+              ];
+              for (const d of wipeDirs) {
+                try {
+                  fs.rmSync(path.join(dir, `.docker-rgs/${d}`), { recursive: true, force: true });
+                } catch {}
+              }
+            });
           } catch {}
         }
         return Promise.resolve();
@@ -2492,8 +2906,15 @@ exit 0
    */
   private writePhysicalEnvFile(worktreeDir: string, envObj: Record<string, string>) {
     const content = Object.entries(envObj)
-      // Filter out huge raw OS variables we don't need to write to disk
-      .filter(([k]) => !k.startsWith('npm_') && k !== 'PATH' && k !== 'LS_COLORS')
+      // Filter out huge raw OS variables and Antigravity system variables
+      .filter(
+        ([k]) =>
+          !k.startsWith('npm_') &&
+          !k.startsWith('ANTIGRAVITY_') &&
+          !k.startsWith('AGY_') &&
+          k !== 'PATH' &&
+          k !== 'LS_COLORS',
+      )
       .map(([k, v]) => {
         const strVal = String(v);
         // Only wrap in quotes if the value contains a space or a newline

@@ -35,7 +35,13 @@ fi
 echo "🐳 Stopping Docker Compose Projects..."
 for compose_file in "$WORKTREE_BASE"/*/docker-compose.yml; do
   if [ -f "$compose_file" ]; then
+    dir=$(dirname "$compose_file")
     docker compose -f "$compose_file" down -v --remove-orphans --timeout 5 2>/dev/null || true
+    
+    # ---> FIX: Nuke bind-mounted data volumes specifically <---
+    for d in mongo/primary/data mongo/secondary/data postgreSql/data redis/data rustfs/data; do
+      rm -rf "$dir/.docker-rgs/$d" 2>/dev/null || true
+    done
   fi
 done
 if [ -f "src/docker-compose.observability.yml" ]; then

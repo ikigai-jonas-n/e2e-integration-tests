@@ -58,3 +58,7 @@ build/
 *.tsbuildinfo
 
 /docs
+
+# Local developer overrides (e.g. extraPackages for instrumentation)
+# Never commit this — it is machine-specific.
+src/e2e-local.override.yml

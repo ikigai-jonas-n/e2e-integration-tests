@@ -16,7 +16,7 @@ global:
   # Slugs: service-apis, internal-apis, experience-apis, flow-bet-action, 
   #        flow-lobby, flow-maintenance, flow-bridge
   skipSuites:
-    - internal-apis
+    # - internal-apis
     - flow-bridge
 
   # Global data flushing defaults on startup
@@ -48,7 +48,7 @@ repos:
 
   remote-game-server-no-db:
     repoPath: "../remote-game-server"
-    target: "origin/main"                          # game-activity, job-stale-rounds, job-close-inactive
+    target: "1.15.1"                          # game-activity, job-stale-rounds, job-close-inactive
     migrationEnvFile: ".env.billing.example"  # first svc (game-activity) has no DB credentials
     envOverrides:
       DB_NAME: "slot_main"
@@ -61,14 +61,14 @@ repos:
 
   remote-game-server-billing:
     repoPath: "../remote-game-server"
-    target: "LGRGS-487"                        # billing
+    target: "LGRGS-483"                        # billing
     alwaysRedoMigration: false
     # uses billing env by default — has all DB credentials
     # DB_NAME=slot, MONGO_NAME=rgs (defaults from .env.billing.example)
 
   remote-game-server-bridge:
     repoPath: "../remote-game-server"
-    target: "LGRGS-487"
+    target: "LGRGS-483"
     # target: "fix-bridge-version-mismatch"                         # bridge
     alwaysRedoMigration: false
     migrationEnvFile: ".env.billing.example"  # bridge env has no DB credentials
@@ -76,7 +76,7 @@ repos:
 
   remote-game-server-game:
     repoPath: "../remote-game-server"
-    target: "LGRGS-487"                        # game
+    target: "LGRGS-483"                        # game
     alwaysRedoMigration: false
     migrationEnvFile: ".env.billing.example"  # game env may lack postgres credentials
 

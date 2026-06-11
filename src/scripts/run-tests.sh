@@ -35,13 +35,10 @@ E2E_LOG_DIR="$LOG_DIR" FORCE_COLOR=1 bun test src/tests "$@" 2>&1 \
 TEST_EXIT_CODE=${PIPESTATUS[0]}
 
 # ── Auto-rerun on stale environment ──────────────────────────────────────────
-# Background branch-validation writes this marker when remote branches moved.
-# Re-execute with a fresh timestamp and log dir so setup runs clean.
+# How your shell runner automatically manages the rerun loop in the background:
 if [ -f "$MARKER" ]; then
   rm -f "$MARKER"
-  echo ""
-  echo "🔄 Remote branches updated during run. Rerunning with fresh environment..."
-  echo ""
+  echo "🔄 Remote branches updated or environment healed. Rerunning with fresh environment..."
   exec "$0" "$@"
 fi
 
