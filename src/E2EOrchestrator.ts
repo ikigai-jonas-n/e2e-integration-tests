@@ -358,16 +358,16 @@ export class E2EOrchestrator {
   }
 
   private killProcessesOnPorts(ports: string[] | undefined): void {
-    for (const port of (ports ?? [])
-      .map((p) => hostPort([p]))
-      .filter((p): p is number => p !== null)) {
-      try {
-        execSync(
-          `lsof -P -n -i:${port} -sTCP:LISTEN | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`,
-        );
-      } catch {}
+      for (const port of (ports ?? [])
+        .map((p) => hostPort([p]))
+        .filter((p): p is number => p !== null)) {
+        try {
+          execSync(
+            `lsof -P -n -i:${port} -sTCP:LISTEN 2>/dev/null | grep -E 'node|bun' | awk '{print $2}' | sort -u | xargs kill -9 2>/dev/null || true`,
+          );
+        } catch {}
+      }
     }
-  }
 
   // ─── Build cache ──────────────────────────────────────────────────────────
 
@@ -841,7 +841,8 @@ export class E2EOrchestrator {
               ));
 
             if (!targetSha) throw new Error(`Cannot resolve ref '${repo.target}'.`);
-            await this.runAsync(`git checkout --detach ${targetSha}`, targetDir);
+                        // FIX: Use --force to instantly discard stale package.json modifications injected by extraPackages
+                        await this.runAsync(`git checkout --force --detach ${targetSha}`, targetDir);
           } else {
             // Cold Provisioning: Worktree doesn't exist yet
             console.log(`   -> Checking out ${repoName} @ ${repo.target}...`);
@@ -1127,30 +1128,6 @@ export class E2EOrchestrator {
         const composeFile = path.join(dir, 'docker-compose.yml');
         if (!fs.existsSync(composeFile)) return;
 
-        // ---> AUTOMATED VOLUME INVALIDATION LAYER <---
-        if (this._changedRepos.has(repoName)) {
-          console.log(
-            `   -> 🧹 Branch/Target change detected for ${repoName}. Auto-clearing stale volumes...`,
-          );
-          try {
-            await this.runAsync('docker compose down -v --remove-orphans', dir).catch(() => {});
-
-            // ONLY wipe the data folders. Do NOT delete tracked files like init-replica-set.sh!
-            const wipeDirs = [
-              'mongo/primary/data',
-              'mongo/secondary/data',
-              'postgreSql/data',
-              'redis/data',
-              'rustfs/data',
-            ];
-            for (const d of wipeDirs) {
-              fs.rmSync(path.join(dir, `.docker-rgs/${d}`), { recursive: true, force: true });
-            }
-          } catch (e) {
-            /* non-fatal fallback */
-          }
-        }
-
         console.log(`   -> Bringing up ${repoName} infra...`);
 
         // Patch macOS AirPlay port conflicts
@@ -1427,121 +1404,135 @@ export class E2EOrchestrator {
   }
 
   async runGlobalMigrations() {
-    // Fast-path: check if there are any forced-redo repos WITHOUT doing expensive
-    // flushDatabases (Docker exec) first. Only run flushDatabases when actually needed.
-    const hasForcedRedoRepos = Object.values(orchestratorCfg.repos).some(
-      (r) => r.alwaysRedoMigration,
-    );
-
-    if (this._warmStart && !hasForcedRedoRepos) {
-      console.log('⚡ Warm start: skipping migrations.');
-      return;
-    }
-
-    const targetsToRedo = this.flushDatabases();
-    const hasForcedRedo = hasForcedRedoRepos || targetsToRedo.size > 0;
-
-    if (this._warmStart && !hasForcedRedo) {
-      console.log('⚡ Warm start: skipping migrations.');
-      return;
-    }
-
-    console.log('🗄️  Running DB Migrations...');
-
-    const migrateBin = path.resolve('./node_modules/.bin/migrate');
-    const reposMigrated = new Set<string>();
-
-    for (const svc of Object.values(composeServices)) {
-      const repo = svc['x-repo'];
-      if (!repo || reposMigrated.has(repo)) continue;
-
-      const repoCfg = orchestratorCfg.repos[repo];
-      const { dbName, mongoName } = this.deduceIsolatedNames(repo, repoCfg, svc);
-
-      // ---> BOTTLENECK OPTIMIZATION: PARTIAL WARM START SHORT-CIRCUIT <---
-      // If we are doing a partial warm start, and THIS repo didn't change,
-      // AND its databases weren't explicitly targeted for a wipe (flushData),
-      // skip migrating its DB entirely to save several seconds of I/O overhead.
-      if (
-        this._partialWarmStart &&
-        !this._changedRepos.has(repo) &&
-        !repoCfg?.alwaysRedoMigration &&
-        !targetsToRedo.has(dbName) &&
-        !targetsToRedo.has(mongoName)
-      ) {
-        continue;
-      }
-
-      const worktreeDir = path.join(this.worktreeBase, repo);
-      const migrationsDir = path.join(worktreeDir, 'db-migrations');
-
-      if (repoCfg?.skipMigration === true || !fs.existsSync(migrationsDir)) continue;
-      reposMigrated.add(repo);
-
-      const migrationEnv = this.buildEnvironment(worktreeDir, svc, repo, repoCfg, true);
-
-      // --- REPLACE THE MINIMAL ENV HACK WITH THIS ---
-      this.writePhysicalEnvFile(worktreeDir, migrationEnv);
-
-      // Release locks if redo is needed
-      if (this._warmStart && repoCfg?.alwaysRedoMigration) {
-        this.killProcessesOnPorts(svc.ports);
-      }
-
-      const dbs = fs
-        .readdirSync(migrationsDir)
-        .filter((f) => fs.statSync(path.join(migrationsDir, f)).isDirectory());
-
-      // We only want to migrate the specific targets for this variant
-      const targets = [
-        { name: dbName, isMongo: false, source: 'slot' },
-        { name: mongoName, isMongo: true, source: 'rgs' },
-      ];
-
-      for (const target of targets) {
-        const sourcePath = path.join(migrationsDir, target.source);
-        const targetPath = path.join(migrationsDir, target.name);
-
-        // Skip if the source folder (e.g. 'slot') doesn't actually exist in this repo
-        if (!fs.existsSync(sourcePath)) continue;
-
-        // Ensure target symlink exists
-        if (target.name !== target.source) {
-          if (fs.existsSync(targetPath)) fs.rmSync(targetPath, { recursive: true, force: true });
-          fs.symlinkSync(target.source, targetPath, 'dir');
+      const explicitTargetsToRedo = this.flushDatabases();
+      let anyMigrationsRan = false;
+  
+      const migrateBin = path.resolve('./node_modules/.bin/migrate');
+      const reposMigrated = new Set<string>();
+  
+      for (const svc of Object.values(composeServices)) {
+        const repo = svc['x-repo'];
+        if (!repo || reposMigrated.has(repo)) continue;
+  
+        const repoCfg = orchestratorCfg.repos[repo];
+        const { dbName, mongoName } = this.deduceIsolatedNames(repo, repoCfg, svc);
+        const worktreeDir = path.join(this.worktreeBase, repo);
+        const migrationsDir = path.join(worktreeDir, 'db-migrations');
+  
+        if (repoCfg?.skipMigration === true || !fs.existsSync(migrationsDir)) continue;
+        reposMigrated.add(repo);
+  
+        // ---> SMART MIGRATION DETECTOR <---
+        // Deterministically hashes all .sql and .js file contents to catch branch changes instantly
+        const stateFile = path.join(worktreeDir, '.e2e-migration-state.json');
+        let prevHash = '';
+        try { prevHash = fs.readFileSync(stateFile, 'utf-8'); } catch {}
+  
+        let currentHash = 'unknown';
+        try {
+          const files = fs.readdirSync(migrationsDir, { recursive: true }) as string[];
+          const contents = files
+            .filter(f => f.endsWith('.sql') || f.endsWith('.js'))
+            .sort()
+            .map(f => {
+               try { return f + ':' + fs.readFileSync(path.join(migrationsDir, f), 'utf-8'); }
+               catch { return ''; }
+            })
+            .join('|');
+          
+          let h = 5381;
+          for (let i = 0; i < contents.length; i++) h = ((h << 5) + h) ^ contents.charCodeAt(i);
+          currentHash = (h >>> 0).toString(16);
+        } catch {}
+  
+        // FIX: Only trigger a wipe if a previous hash ACTUALLY existed. 
+              // This prevents phantom wipes on fresh worktrees after a reset:hard.
+              const migrationsChanged = !!currentHash && currentHash !== 'unknown' && !!prevHash && prevHash !== currentHash;
+  
+        if (migrationsChanged) {
+          console.log(`   -> 🔄 Migration changes detected in ${repo}. Auto-flagging DBs for wipe.`);
         }
-
-        // Handle "Until" logic (shadowing to capped directory)
-        if (repoCfg?.untilMigrationFile) {
-          this.createCappedMigrationDir(sourcePath, targetPath, repoCfg.untilMigrationFile);
+  
+        const targetNeedsRedo = repoCfg?.alwaysRedoMigration || migrationsChanged || explicitTargetsToRedo.has(dbName) || explicitTargetsToRedo.has(mongoName);
+  
+        // --- BOTTLENECK OPTIMIZATION ---
+        // Skip if nothing changed and no explicit wipe was requested
+        if (this._warmStart && !targetNeedsRedo) {
+          continue;
         }
-
-        // REDO Logic - Triggered explicitly by YAML flushData or alwaysRedoMigration
-        // (Removed automatic wipe on repo change to drastically speed up incremental migrations)
-        const targetNeedsRedo = repoCfg?.alwaysRedoMigration || targetsToRedo.has(target.name);
-
+        if (this._partialWarmStart && !this._changedRepos.has(repo) && !targetNeedsRedo) {
+          continue;
+        }
+  
+        if (!anyMigrationsRan) {
+          console.log('🗄️  Running DB Migrations...');
+          anyMigrationsRan = true;
+        }
+  
+        const migrationEnv = this.buildEnvironment(worktreeDir, svc, repo, repoCfg, true);
+        this.writePhysicalEnvFile(worktreeDir, migrationEnv);
+  
+        // Release port locks if redo is needed
         if (targetNeedsRedo) {
-          console.log(`   -> [REDO] Wiping ${target.name}...`);
-          Bun.spawnSync([migrateBin, 'down', target.name, 'all'], {
+          this.killProcessesOnPorts(svc.ports);
+        }
+  
+        const targets = [
+          { name: dbName, isMongo: false, source: 'slot' },
+          { name: mongoName, isMongo: true, source: 'rgs' },
+        ];
+  
+        let migrationFailed = false;
+  
+        for (const target of targets) {
+          const sourcePath = path.join(migrationsDir, target.source);
+          const targetPath = path.join(migrationsDir, target.name);
+  
+          if (!fs.existsSync(sourcePath)) continue;
+  
+          if (target.name !== target.source) {
+            if (fs.existsSync(targetPath)) fs.rmSync(targetPath, { recursive: true, force: true });
+            fs.symlinkSync(target.source, targetPath, 'dir');
+          }
+  
+          if (repoCfg?.untilMigrationFile) {
+            (this as any).createCappedMigrationDir?.(sourcePath, targetPath, repoCfg.untilMigrationFile);
+          }
+  
+          if (targetNeedsRedo) {
+            console.log(`   -> [REDO] Wiping ${target.name}...`);
+            Bun.spawnSync([migrateBin, 'down', target.name, 'all'], {
+              cwd: worktreeDir,
+              env: migrationEnv as any,
+              stdout: 'inherit',
+              stderr: 'inherit',
+            });
+          }
+  
+          console.log(`   -> Migrating ${repo} -> ${target.name}`);
+          const proc = Bun.spawnSync([migrateBin, 'up', target.name], {
             cwd: worktreeDir,
-            env: migrationEnv as any,
             stdout: 'inherit',
             stderr: 'inherit',
+            env: migrationEnv as any,
           });
+  
+          if (proc.exitCode !== 0) {
+            migrationFailed = true;
+            throw new Error(`❌ Migration failed for ${target.name}`);
+          }
         }
-
-        console.log(`   -> Migrating ${repo} -> ${target.name}`);
-        const proc = Bun.spawnSync([migrateBin, 'up', target.name], {
-          cwd: worktreeDir,
-          stdout: 'inherit',
-          stderr: 'inherit',
-          env: migrationEnv as any,
-        });
-
-        if (proc.exitCode !== 0) throw new Error(`❌ Migration failed for ${target.name}`);
+  
+        // Save the hash only if all databases migrated successfully
+        if (!migrationFailed && currentHash !== 'unknown') {
+          fs.writeFileSync(stateFile, currentHash);
+        }
+      }
+  
+      if (!anyMigrationsRan && (this._warmStart || this._partialWarmStart)) {
+        console.log('⚡ Warm start: skipping migrations (no schema changes detected).');
       }
     }
-  }
 
   async runServices() {
     const seqEnabled = !!orchestratorCfg.observability?.seq;
@@ -2611,7 +2602,7 @@ exit 0
    * Swagger detection: probes common swagger UI paths concurrently. Fast (800ms timeout,
    * all services in parallel). Shows link only when the endpoint actually responds.
    */
-  private async printEnvironmentSummary() {
+  public async printEnvironmentSummary() {
     const portedServices = Object.entries(composeServices).filter(
       ([, s]) => s['x-repo'] && hostPort(s.ports),
     );

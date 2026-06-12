@@ -1,19 +1,19 @@
 global:
   # Where git worktrees for each repo are checked out
-  worktreeBasePath: "./.e2e-worktrees"
+  worktreeBasePath: './.e2e-worktrees'
 
   cleanOnTeardown: false
   verbose: false
   network: null
 
-  # Defines the target game and RTP band for the test suite. 
+  # Defines the target game and RTP band for the test suite.
   # All tests, clients, and API helpers sync to these values.
   testConfig:
-    targetGameCode: "LGS-004"
-    targetRtpCode: "RTP_97"
+    targetGameCode: 'LGS-004'
+    targetRtpCode: 'RTP_97'
 
   # Suites to permanently skip by default (e.g. slow Kafka propagation flows)
-  # Slugs: service-apis, internal-apis, experience-apis, flow-bet-action, 
+  # Slugs: service-apis, internal-apis, experience-apis, flow-bet-action,
   #        flow-lobby, flow-maintenance, flow-bridge
   skipSuites:
     # - internal-apis
@@ -21,7 +21,7 @@ global:
 
   # Global data flushing defaults on startup
   flushData:
-    redis: true      # Clears deduced Redis namespaces
+    redis: true # Clears deduced Redis namespaces
     # mongo: true      # Drops deduced Mongo databases
     # postgres: false  # Runs 'migrate down all'. Default false to speed up local boots.
 
@@ -31,12 +31,12 @@ global:
 # Each entry gets its own worktree directory and independent build cache.
 repos:
   queue-service:
-    repoPath: "../queue-service"
-    target: "main"
+    repoPath: '../queue-service'
+    target: 'main'
 
   slot-game-server:
-    repoPath: "../slot-game-server"
-    target: "fix-sexyfruits-screen-generation"
+    repoPath: '../slot-game-server'
+    target: 'fix-sexyfruits-screen-generation'
 
   # remote-game-server — one worktree per version
   # services sharing the same worktree key share a single build (npm install + build runs once)
@@ -47,12 +47,12 @@ repos:
   # while envOverrides changes the database name to keep them isolated.
 
   remote-game-server-no-db:
-    repoPath: "../remote-game-server"
-    target: "1.15.1"                          # game-activity, job-stale-rounds, job-close-inactive
-    migrationEnvFile: ".env.billing.example"  # first svc (game-activity) has no DB credentials
+    repoPath: '../remote-game-server'
+    target: '1.15.1' # game-activity, job-stale-rounds, job-close-inactive
+    migrationEnvFile: '.env.billing.example' # first svc (game-activity) has no DB credentials
     envOverrides:
-      DB_NAME: "slot_main"
-      MONGO_NAME: "rgs_main"
+      DB_NAME: 'slot_main'
+      MONGO_NAME: 'rgs_main'
     # Example of a granular override:
     # flushData:
     #   mongo: false
@@ -60,25 +60,25 @@ repos:
     skipMigration: true
 
   remote-game-server-billing:
-    repoPath: "../remote-game-server"
-    target: "LGRGS-483"                        # billing
+    repoPath: '../remote-game-server'
+    target: 'LGRGS-498' # billing
     alwaysRedoMigration: false
     # uses billing env by default — has all DB credentials
     # DB_NAME=slot, MONGO_NAME=rgs (defaults from .env.billing.example)
 
   remote-game-server-bridge:
-    repoPath: "../remote-game-server"
-    target: "LGRGS-483"
+    repoPath: '../remote-game-server'
+    target: 'LGRGS-498'
     # target: "fix-bridge-version-mismatch"                         # bridge
     alwaysRedoMigration: false
-    migrationEnvFile: ".env.billing.example"  # bridge env has no DB credentials
+    migrationEnvFile: '.env.billing.example' # bridge env has no DB credentials
     skipMigration: true
 
   remote-game-server-game:
-    repoPath: "../remote-game-server"
-    target: "LGRGS-483"                        # game
+    repoPath: '../remote-game-server'
+    target: 'LGRGS-498' # game
     alwaysRedoMigration: false
-    migrationEnvFile: ".env.billing.example"  # game env may lack postgres credentials
+    migrationEnvFile: '.env.billing.example' # game env may lack postgres credentials
 
 # Observability tools started automatically alongside infra.
 observability:
@@ -97,9 +97,9 @@ observability:
 composeServiceEnvOverrides:
   queue-service:
     kafka-region:
-      KAFKA_CFG_ADVERTISED_LISTENERS: "INTERNAL://kafka-region:9092,EXTERNAL://kafka-region:9093,CONTROLLER://kafka-region:9094"
+      KAFKA_CFG_ADVERTISED_LISTENERS: 'INTERNAL://kafka-region:9092,EXTERNAL://kafka-region:9093,CONTROLLER://kafka-region:9094'
     kafka-global:
-      KAFKA_CFG_ADVERTISED_LISTENERS: "INTERNAL://kafka-global:9092,EXTERNAL://kafka-global:9193,CONTROLLER://kafka-global:9094"
+      KAFKA_CFG_ADVERTISED_LISTENERS: 'INTERNAL://kafka-global:9092,EXTERNAL://kafka-global:9193,CONTROLLER://kafka-global:9094'
   remote-game-server:
     redis:
-      _note: "Bridge mode requires --cluster-announce-hostname redis-cluster in Redis startup"
+      _note: 'Bridge mode requires --cluster-announce-hostname redis-cluster in Redis startup'

@@ -98,8 +98,8 @@ if [ "$HARD_RESET" = true ]; then
     (rm -rf "$TMP_TRASH" &)
   fi
 
-  # Clear build caches
-  find . -name ".e2e-state.json" -delete 2>/dev/null || true
+  # Clear build and migration caches
+    find . -name "*state.json" -delete 2>/dev/null || true
 
   # Clear the Super Optimistic state tracker and rerun markers <---
   rm -f "$WORKTREE_BASE/.e2e-ready.json" 2>/dev/null || true

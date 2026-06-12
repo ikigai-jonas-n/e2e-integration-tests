@@ -35,6 +35,9 @@ async function main() {
     await orchestrator.runGlobalMigrations();
     await orchestrator.runServices();
 
+    // ---> FIX: Output the beautiful terminal table and write Postman configs!
+        await orchestrator.printEnvironmentSummary();
+
     console.log('\n✅ E2E environment is ready. Services are running.');
     console.log('   Press Ctrl+C to exit (services keep running in background).');
     console.log('   Run tests: bun test');
